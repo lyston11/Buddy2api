@@ -10,6 +10,7 @@ auth_manager.py — 多账号凭据管理
 """
 
 import asyncio
+import contextvars
 import json
 import os
 import sys
@@ -27,6 +28,22 @@ import fingerprint
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 
+# 内部域：token 由 copilot.tencent.com 侧签发，统一走 BACKEND。
+# 其它域（如 www.workbuddy.ai 国际版）的 token 由各自 realm 签发，
+# copilot.tencent.com 的 APISIX 对它们一律 401，必须打各自域名的后端。
+# 名单取自两个客户端 product.json 的 authentication.attributes.internalDomain 并集：
+#   WorkBuddy.app（国内版）+ WorkBuddy AI.app（国际版）
+_INTERNAL_DOMAINS = frozenset(
+    {
+        "copilot.tencent.com",
+        "staging-copilot.tencent.com",
+        "www.codebuddy.cn",
+        "staging.codebuddy.cn",
+        "www.workbuddy.cn",
+        "staging.workbuddy.cn",
+    }
+)
+
 # 官方 Work Buddy / CodeBuddy CLI 客户端指纹（见 fingerprint.py）。
 # 兼容保留 CB_GATEWAY_USER_AGENT 覆盖；如上游不接受新 UA，
 # 设 CB_GATEWAY_USER_AGENT=codebuddy2openai/2.0 可回退到历史 UA。
@@ -40,6 +57,13 @@ _sticky_account_id: dict[str, int] = {}
 _failure_lock = threading.Lock()
 _account_failures: dict[int, tuple[int, float]] = {}
 
+# API Key 级账号绑定：0 = 不绑定（走原有优先级 + 粘性调度），>0 = 只用该 accounts.id。
+# 用 contextvars 而不是给 pick_account 加参数，是为了不改 providers/* 与 proxy.py 的调用签名；
+# 由 server.py 在一次请求的入口处写入，异步生成器和 run_in_threadpool 都会继承该上下文。
+_pinned_account_id: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "cb_pinned_account_id", default=0
+)
+
 
 def _get_token_lock(aid: int) -> asyncio.Lock:
     with _token_locks_guard:
@@ -48,9 +72,34 @@ def _get_token_lock(aid: int) -> asyncio.Lock:
         return _token_locks[aid]
 
 
+def _domain_backend(account: Optional[dict]) -> Optional[str]:
+    """账号域名不属于内部域时返回该域名自身的后端，否则返回 None（用默认 BACKEND）。"""
+    if not account:
+        return None
+    if os.environ.get("CB_GATEWAY_DOMAIN_BACKEND", "1").strip().lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }:
+        return None
+    domain = str(account.get("domain") or "").strip().lower()
+    if not domain or domain in _INTERNAL_DOMAINS:
+        return None
+    return f"https://{domain}"
+
+
 def backend_url() -> str:
     value = str(db.get_setting("backend_url", BACKEND) or BACKEND).strip().rstrip("/")
     return value if value.startswith("https://") else BACKEND
+
+
+def account_backend_url(account: Optional[dict] = None) -> str:
+    """按账号 realm 选后端；无路由规则时回落到全局 backend_url()。
+
+    与 backend_url() 分层，是为了让只覆盖全局地址的调用方/测试继续生效。
+    """
+    return _domain_backend(account) or backend_url()
 
 
 def request_timeout(default: int) -> int:
@@ -65,6 +114,46 @@ def mark_account_success(aid: int):
         _account_failures.pop(aid, None)
 
 
+def reload_credentials_from_auth_path(aid: int) -> bool:
+    """用账号记录的 auth 文件重新读取凭据。
+
+    桌面客户端会自己轮换 token 并写回 auth 文件，而网关只在启动时导入一次。
+    文件里已换成新 token 时采纳之，返回 True；文件缺失/未变返回 False。
+    """
+    try:
+        account = db.get_account(aid)
+        if not account:
+            return False
+        extra = account.get("extra")
+        raw = extra.get("auth_path") if isinstance(extra, dict) else None
+        if not raw:
+            return False
+        parsed = parse_auth_file(Path(raw))
+        if not parsed:
+            return False
+        if parsed.get("access_token") == account.get("access_token"):
+            return False
+        db.update_account(aid, parsed)
+        return True
+    except Exception as exc:  # 自救路径不得抛出，否则会盖掉它本该记录的错误
+        print(f"[auth_manager] 从 auth 文件重载失败 (account={aid}): {exc}", file=sys.stderr)
+        return False
+
+
+def mark_account_expired(aid: int, reason: str = ""):
+    """把账号判为失效，但先试一次自救：客户端可能已轮换 token 并写回 auth 文件。
+
+    否则一次 401/403 就会永久打死账号（本函数是唯一置 expired 的入口）。
+    """
+    if reload_credentials_from_auth_path(aid):
+        print(
+            f"[auth_manager] account={aid} 已从 auth 文件载入新凭据，保留可用状态 {reason}",
+            file=sys.stderr,
+        )
+        return
+    db.update_account(aid, {"status": "expired"})
+
+
 def mark_account_failure(aid: int, status_code: int = 0):
     with _failure_lock:
         count, _ = _account_failures.get(aid, (0, 0.0))
@@ -73,7 +162,7 @@ def mark_account_failure(aid: int, status_code: int = 0):
         cooldown = min(300, base * (2 ** min(count - 1, 4)))
         _account_failures[aid] = (count, time.monotonic() + cooldown)
     if status_code in {401, 403}:
-        db.update_account(aid, {"status": "expired"})
+        mark_account_expired(aid, reason=f"(chat HTTP {status_code})")
 
 
 def account_is_cooling_down(aid: int) -> bool:
@@ -394,7 +483,7 @@ async def refresh_token(account: dict) -> bool:
     lock = _get_token_lock(aid)
     async with lock:
         headers = build_refresh_headers(account)
-        url = f"{backend_url()}/v2/plugin/auth/token/refresh"
+        url = f"{account_backend_url(account)}/v2/plugin/auth/token/refresh"
 
         try:
             async with httpx.AsyncClient(timeout=request_timeout(15)) as c:
@@ -407,8 +496,8 @@ async def refresh_token(account: dict) -> bool:
         if not isinstance(data, dict) or data.get("code") != 0 or not data.get("data"):
             message = data.get("msg", "upstream rejected refresh") if isinstance(data, dict) else "invalid response"
             print(f"[auth_manager] 刷新 token 失败 (account={aid}): {str(message)[:240]}", file=sys.stderr)
-            # 标记账号为过期
-            db.update_account(aid, {"status": "expired"})
+            # 标记账号为过期（先试一次从 auth 文件自救）
+            mark_account_expired(aid, reason="(refresh rejected)")
             return False
 
         new_auth = data["data"]
@@ -710,7 +799,7 @@ async def fetch_account_resources(
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(25)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/get-user-resource", headers=headers, json={})
+            r = await c.post(f"{account_backend_url(account)}/v2/billing/meter/get-user-resource", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _resource_failure(
@@ -832,7 +921,7 @@ async def fetch_checkin_status(
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(20)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
+            r = await c.post(f"{account_backend_url(account)}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _checkin_failure(account, status_code=0, message=str(e)[:240], allow_stale=allow_stale)
@@ -886,7 +975,7 @@ async def claim_daily_checkin(account: dict) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(30)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/daily-checkin", headers=headers, json={})
+            r = await c.post(f"{account_backend_url(account)}/v2/billing/meter/daily-checkin", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _checkin_result(account, ok=False, status_code=0, message=str(e)[:240])
@@ -959,9 +1048,43 @@ def _set_sticky_account(aid: int, provider: str = "workbuddy"):
         _sticky_account_id[provider] = aid
 
 
+def set_pinned_account(aid: Optional[int]) -> None:
+    """把当前请求绑定到固定账号。0/None 表示不绑定。"""
+    try:
+        value = int(aid or 0)
+    except (TypeError, ValueError):
+        value = 0
+    _pinned_account_id.set(value if value > 0 else 0)
+
+
+def pinned_account_id() -> int:
+    """当前请求绑定的账号 id，0 表示未绑定。"""
+    return int(_pinned_account_id.get() or 0)
+
+
+def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str) -> Optional[dict]:
+    """绑定账号时的选择逻辑：只认这一个账号，不可用就返回 None（不偷偷换号）。"""
+    if aid in exclude_ids or account_is_cooling_down(aid):
+        return None
+    target = db.get_account(aid)
+    if not target:
+        return None
+    if str(target.get("provider") or "workbuddy") != provider:
+        return None
+    if str(target.get("status") or "") != "active":
+        return None
+    return target
+
+
 def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> Optional[dict]:
-    """选择一个可用账号。优先级越高越先用，同优先级尽量粘住当前账号。"""
+    """选择一个可用账号。优先级越高越先用，同优先级尽量粘住当前账号。
+
+    API Key 若绑定了账号（default_account>0），则只返回该账号。
+    """
     exclude_ids = exclude_ids or set()
+    pinned = pinned_account_id()
+    if pinned:
+        return _pick_pinned_account(pinned, exclude_ids, provider)
     accounts = db.get_active_accounts(provider)
     candidates = [
         a for a in accounts
@@ -991,6 +1114,22 @@ async def pick_account_with_fallback(
     account = pick_account(exclude_ids, provider=provider)
     if account:
         return account
+
+    pinned = pinned_account_id()
+    if pinned:
+        # 绑定了账号：只刷新这一个，不碰其它账号。
+        target = db.get_account(pinned)
+        if (
+            target
+            and str(target.get("provider") or "workbuddy") == provider
+            and pinned not in (exclude_ids or set())
+            and await refresh_token(target)
+        ):
+            fresh = db.get_account(pinned)
+            if fresh:
+                _set_sticky_account(fresh["id"], provider)
+            return fresh
+        return None
 
     expired_accounts = sorted(
         (

@@ -330,6 +330,16 @@ def _migrate_api_keys(conn: sqlite3.Connection):
         "UPDATE api_keys SET default_channel='workbuddy' "
         "WHERE default_channel IS NULL OR default_channel=''"
     )
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+    if "default_account" not in cols:
+        conn.execute(
+            "ALTER TABLE api_keys ADD COLUMN default_account INTEGER NOT NULL DEFAULT 0"
+        )
+    # 0 = 不绑定（走原调度）；>0 = 只走该 accounts.id
+    conn.execute(
+        "UPDATE api_keys SET default_account=0 "
+        "WHERE default_account IS NULL OR default_account < 0"
+    )
 
 
 def _dedupe_accounts_provider_uid(conn: sqlite3.Connection):
@@ -656,18 +666,23 @@ def get_account_checkin_cache(account_id: int, today_only: bool = True) -> Optio
 
 def add_api_key(key: str, name: str, allowed_models: Optional[list] = None,
                 daily_limit: Optional[int] = None, client_type: str = "custom",
-                default_channel: str = "workbuddy") -> int:
+                default_channel: str = "workbuddy",
+                default_account: Optional[int] = None) -> int:
     now = int(time.time())
     models_json = json.dumps(allowed_models) if allowed_models else None
     limit = int(daily_limit or 0)
     channel = str(default_channel or "workbuddy").strip() or "workbuddy"
+    try:
+        account_id = max(0, int(default_account or 0))
+    except (TypeError, ValueError):
+        account_id = 0
     with _lock:
         conn = get_conn()
         cur = conn.execute("""
             INSERT INTO api_keys
                 (key_prefix, key_hash, key_secret, name, status, allowed_models,
-                 daily_limit, client_type, default_channel, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+                 daily_limit, client_type, default_channel, default_account, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
             _key_prefix(key),
             _hash_api_key(key),
@@ -678,6 +693,7 @@ def add_api_key(key: str, name: str, allowed_models: Optional[list] = None,
             limit,
             client_type,
             channel,
+            account_id,
             now,
         ))
         kid = cur.lastrowid
@@ -689,11 +705,17 @@ def add_api_key(key: str, name: str, allowed_models: Optional[list] = None,
 def update_api_key(kid: int, data: dict):
     fields = []
     values = []
-    for k in ["name", "status", "allowed_models", "daily_limit", "client_type", "default_channel"]:
+    for k in ["name", "status", "allowed_models", "daily_limit", "client_type",
+              "default_channel", "default_account"]:
         if k in data:
             val = data[k]
             if k == "allowed_models" and isinstance(val, list):
                 val = json.dumps(val) if val else None
+            if k == "default_account":
+                try:
+                    val = max(0, int(val or 0))
+                except (TypeError, ValueError):
+                    continue
             fields.append(f"{k}=?")
             values.append(val)
     if not fields:
