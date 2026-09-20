@@ -74,8 +74,17 @@ def connection():
 def _protect_account_data(data: dict) -> dict:
     protected = dict(data)
     for field in _CREDENTIAL_FIELDS:
-        if field in protected:
-            protected[field] = credential_crypto.encrypt_secret(protected.get(field), DB_PATH)
+        if field not in protected:
+            continue
+        value = protected.get(field)
+        if isinstance(value, str) or value is None:
+            protected[field] = credential_crypto.encrypt_secret(value, DB_PATH)
+        else:
+            # 启动路径必须对脏数据健壮：凭据字段混进非字符串（如上游格式
+            # 变更漏进来的 dict）不能让整个服务崩溃，序列化后照常落库。
+            protected[field] = credential_crypto.encrypt_secret(
+                json.dumps(value, ensure_ascii=False, sort_keys=True), DB_PATH
+            )
     return protected
 
 

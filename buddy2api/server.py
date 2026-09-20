@@ -40,6 +40,7 @@ import buddy2api.responses as responses
 import buddy2api.providers as providers
 import buddy2api.router as router
 import buddy2api.control_plane as control_plane
+import buddy2api.seamless_login as seamless_login
 from buddy2api.paths import PROJECT_ROOT
 from buddy2api.providers.protocol import KNOWN_CHANNEL_SET
 from buddy2api.providers.qclaw.store import default_guid, upsert_account as upsert_qclaw_account
@@ -640,6 +641,50 @@ async def admin_scan_accounts(
     data = await _read_json_object(request, allow_empty=True)
     auth_dir = data.get("auth_dir") if isinstance(data, dict) else None
     return await run_in_threadpool(auth_manager.auto_scan_and_import, auth_dir)
+
+
+# ============================================================
+# 无感登录（OAuth state 轮询）
+#
+# 桌面端新版 auth 文件是 `$wbEncrypted` 信封，网关读不出明文 token；
+# 官方插件 OAuth 接口仍直接下发明文 token，这条路径与信封无关。
+# 见 buddy2api/seamless_login.py 的模块说明。
+# ============================================================
+
+@app.post("/admin/accounts/seamless-login/start")
+async def admin_seamless_login_start(authorization: str | None = Header(default=None)):
+    _check_admin(authorization)
+    try:
+        return await run_in_threadpool(seamless_login.start)
+    except seamless_login.SeamlessLoginError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:240]) from exc
+
+
+@app.get("/admin/accounts/seamless-login/poll")
+async def admin_seamless_login_poll(
+    login_id: str,
+    authorization: str | None = Header(default=None),
+):
+    _check_admin(authorization)
+    try:
+        result = await run_in_threadpool(seamless_login.poll, login_id)
+    except seamless_login.SeamlessLoginError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:240]) from exc
+
+    # 授权成功即刷新一次：既验证新凭据真的可用，也让 expired/inactive 的
+    # 账号借 refresh_token 的成功路径自动回到 active（见 auth_manager.refresh_token）。
+    if result.get("status") == "done":
+        account = db.get_account(int(result["account_id"]))
+        if account and str(account.get("provider") or "workbuddy") == "workbuddy":
+            try:
+                result["refreshed"] = bool(await auth_manager.refresh_token(account))
+            except Exception as exc:  # 刷新失败不影响凭据已入库的事实
+                result["refreshed"] = False
+                result["refresh_error"] = str(exc)[:200]
+            fresh = db.get_account(int(result["account_id"]))
+            if fresh:
+                result["status_after"] = fresh.get("status")
+    return result
 
 
 @app.post("/admin/accounts")
