@@ -193,3 +193,26 @@ def test_discover_accounts_view_lists_unimported_uid(tmp_path):
     assert len(new_rows) == 1 and new_rows[0]["id"] is None
     assert new_rows[0]["importable_files"] == ["workbuddy-desktop-ai.info"]
     assert disc["importable_count"] == 1
+
+
+# ------------------------------------------------------------
+# 凭据来源视图只覆盖 WorkBuddy（2026-09-21）
+# ------------------------------------------------------------
+
+def test_discover_credential_sources_only_list_workbuddy_accounts(tmp_path):
+    """发现面板只扫 WorkBuddy 的 *.info，账号视图也必须只列 WorkBuddy。
+
+    回归：原实现用 db.list_accounts()（全部通道），QClaw / TraeWork 账号会
+    出现在「本机凭据导入」面板里并被标成「仅数据库 · 刷新续期」，看起来
+    像是本机凭据丢了。
+    """
+    db.add_account({"name": "wb", "uid": "u-wb", "access_token": "t",
+                    "domain": "www.workbuddy.cn"})
+    db.add_account({"name": "qclaw", "uid": "u-qc", "access_token": "t", "provider": "qclaw"})
+    db.add_account({"name": "traework", "uid": "u-tw", "access_token": "t", "provider": "traework"})
+
+    view = auth_manager.discover_auth_files(str(tmp_path / "no-such-auth-dir"))
+
+    providers = {row["provider"] for row in view["accounts"]}
+    assert providers == {"workbuddy"}, f"只应列出 WorkBuddy 账号，实际: {providers}"
+    assert [row["name"] for row in view["accounts"]] == ["wb"]

@@ -13,6 +13,13 @@ accessToken/refreshToken 换成了 `$wbEncrypted` 加密信封（AES-256-GCM，
 
 拿到的凭据按 uid 归入已有账号（更新并重新激活）或新建账号，写入走 db 的
 加密路径，与其它凭据一视同仁。
+
+**站点必须分开**：国内版与国际版的 OAuth 接口是两个 host，platform 标识也不同
+（WorkDaddy profiles.js / daemon.js 实测：国内 `www.workbuddy.cn` /
+`www.codebuddy.cn` 用 `workbuddy`，国际 `www.workbuddy.ai` / `www.codebuddy.ai`
+用 `workbuddy-ai`）。拿国际版账号去国内 host 授权，拿到的是国内站的凭据 ——
+要么建出一个错的账号，要么根本对不上。所以 start() 必须指定站点，轮询沿用
+发起时选定的站点。
 """
 
 from __future__ import annotations
@@ -25,18 +32,56 @@ import urllib.request
 from typing import Optional
 
 import buddy2api.database as db
+import buddy2api.sites as sites
 
-API_BASE = "https://www.workbuddy.cn/v2/plugin"
-DEFAULT_PLATFORM = "workbuddy"
 FLOW_TIMEOUT_SECONDS = 600      # state 官方有效期
 RESULT_RETENTION_SECONDS = 300  # 完成后保留结果供前端取回
 USER_AGENT = "buddy2api-seamless-login"
+API_PREFIX = "/v2/plugin"
+
+# 站点 → (API host, platform 标识)。host 与 auth.domain 一致，platform 是官方
+# 客户端标识：国际版必须用 `workbuddy-ai`，否则授权出来的凭据不属于目标站点。
+SITE_ENDPOINTS = {
+    sites.SITE_DOMESTIC: ("https://www.workbuddy.cn", "workbuddy"),
+    sites.SITE_INTERNATIONAL: ("https://www.workbuddy.ai", "workbuddy-ai"),
+}
+DEFAULT_SITE = sites.SITE_DOMESTIC
+DEFAULT_PLATFORM = SITE_ENDPOINTS[DEFAULT_SITE][1]
 
 _flows: dict[str, dict] = {}
 
 
 class SeamlessLoginError(RuntimeError):
     """发起或轮询无感登录失败。"""
+
+
+def site_for_domain(domain) -> str:
+    """账号域名 → 站点分组。没有域名的账号按默认站点（国内版）处理。"""
+    text = str(domain or "").strip()
+    if not text:
+        return DEFAULT_SITE
+    return sites.site_group(text)
+
+
+def available_sites() -> list[dict]:
+    """站点清单（含各自已导入账号数），供前端选站点。"""
+    counts: dict[str, int] = {}
+    for account in db.list_accounts(provider="workbuddy"):
+        group = site_for_domain(account.get("domain"))
+        counts[group] = counts.get(group, 0) + 1
+    return [
+        {
+            "site": group,
+            "api_host": SITE_ENDPOINTS[group][0],
+            "platform": SITE_ENDPOINTS[group][1],
+            "account_count": counts.get(group, 0),
+        }
+        for group in sites.SITE_GROUPS
+    ]
+
+
+def _endpoint(site: str) -> tuple[str, str]:
+    return SITE_ENDPOINTS.get(site) or SITE_ENDPOINTS[DEFAULT_SITE]
 
 
 def _http_json(url: str, method: str = "GET", body=None, headers: Optional[dict] = None, timeout: int = 30) -> dict:
@@ -72,10 +117,16 @@ def _purge(now: Optional[float] = None) -> None:
             _flows.pop(key, None)
 
 
-def start(platform: str = DEFAULT_PLATFORM) -> dict:
-    """申请 state 与授权链接。返回 {login_id, auth_url, expires_in, platform}。"""
+def start(site: str = DEFAULT_SITE) -> dict:
+    """申请 state 与授权链接。返回 {login_id, auth_url, expires_in, site, platform}。
+
+    `site` 决定打哪个 host、用哪个 platform 标识；轮询沿用发起时的选择，
+    所以国际版账号不会被送到国内站授权。
+    """
     _purge()
-    resp = _http_json(f"{API_BASE}/auth/state?platform={platform}", "POST", {})
+    host, platform = _endpoint(site)
+    api_base = f"{host}{API_PREFIX}"
+    resp = _http_json(f"{api_base}/auth/state?platform={platform}", "POST", {})
     data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
     state = str(data.get("state") or "")
     if not state:
@@ -84,11 +135,13 @@ def start(platform: str = DEFAULT_PLATFORM) -> dict:
         data.get("authUrl")
         or data.get("auth_url")
         or data.get("url")
-        or f"{API_BASE.rsplit('/v2/plugin', 1)[0]}/login?platform={platform}&state={state}"
+        or f"{host}/login?platform={platform}&state={state}"
     )
     login_id = "sl_" + secrets.token_urlsafe(16)
     _flows[login_id] = {
+        "site": site,
         "platform": platform,
+        "api_base": api_base,
         "state": state,
         "created_at": time.time(),
         "expires_at": time.time() + FLOW_TIMEOUT_SECONDS,
@@ -100,6 +153,7 @@ def start(platform: str = DEFAULT_PLATFORM) -> dict:
         "login_id": login_id,
         "auth_url": str(auth_url),
         "expires_in": FLOW_TIMEOUT_SECONDS,
+        "site": site,
         "platform": platform,
     }
 
@@ -130,13 +184,18 @@ def _resolve_deadline(token_data: dict, ms_key: str, in_key: str, fallback_secon
     return deadline
 
 
-def _write_credentials(uid: str, token_data: dict, account: dict) -> dict:
-    """按 uid 归入已有账号（更新）或新建账号。返回 {account_id, created, name}。"""
+def _write_credentials(uid: str, token_data: dict, account: dict, site: str = DEFAULT_SITE) -> dict:
+    """按 uid 归入已有账号（更新）或新建账号。返回 {account_id, created, name}。
+
+    `site` 是发起授权时选定的站点：上游没回 `domain` 时用它对应的 host 兜底，
+    避免把国际版账号的域名写成国内站（那会让后续请求打到错的上游）。
+    """
     access = str(token_data.get("accessToken") or token_data.get("access_token") or "")
     refresh = str(token_data.get("refreshToken") or token_data.get("refresh_token") or "")
     if not access:
         raise SeamlessLoginError("授权响应缺少 accessToken")
-    domain = str(token_data.get("domain") or "") or "www.workbuddy.cn"
+    fallback_host = _endpoint(site)[0].split("://", 1)[-1]
+    domain = str(token_data.get("domain") or "") or fallback_host
     nickname = str(account.get("nickname") or "")
     parsed = {
         "name": nickname or str(account.get("phoneNumber") or "") or uid,
@@ -194,7 +253,8 @@ def poll(login_id: str) -> dict:
 
 
 def _poll_locked(flow: dict) -> dict:
-    resp = _http_json(f"{API_BASE}/auth/token?state={flow['state']}")
+    api_base = flow.get("api_base") or f"{_endpoint(flow.get('site') or DEFAULT_SITE)[0]}{API_PREFIX}"
+    resp = _http_json(f"{api_base}/auth/token?state={flow['state']}")
     code = resp.get("code")
     data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
     access = str(data.get("accessToken") or data.get("access_token") or "")
@@ -204,7 +264,7 @@ def _poll_locked(flow: dict) -> dict:
     headers = {"Authorization": f"Bearer {access}"}
     if data.get("domain"):
         headers["X-Domain"] = str(data["domain"])
-    account_resp = _http_json(f"{API_BASE}/login/account?state={flow['state']}", headers=headers)
+    account_resp = _http_json(f"{api_base}/login/account?state={flow['state']}", headers=headers)
     account = account_resp.get("data") if isinstance(account_resp.get("data"), dict) else {}
     uid = str(account.get("uid") or "")
     if not uid:
@@ -213,7 +273,7 @@ def _poll_locked(flow: dict) -> dict:
         return {"status": "error", "error": flow["error"]}
 
     try:
-        written = _write_credentials(uid, data, account)
+        written = _write_credentials(uid, data, account, flow.get("site") or DEFAULT_SITE)
     except Exception as exc:  # 写入失败要把原因带回前端，而不是让流程悬着
         flow["done"] = True
         flow["error"] = str(exc)[:240]

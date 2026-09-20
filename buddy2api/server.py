@@ -652,12 +652,26 @@ async def admin_scan_accounts(
 # ============================================================
 
 @app.post("/admin/accounts/seamless-login/start")
-async def admin_seamless_login_start(authorization: str | None = Header(default=None)):
+async def admin_seamless_login_start(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
     _check_admin(authorization)
+    data = await _read_json_object(request, allow_empty=True)
+    # 站点必须显式选：国内版与国际版的 OAuth 是两个 host，platform 标识也不同。
+    # 不传时默认国内版；前端按已导入账号的站点分布预选。
+    site = str((data or {}).get("site") or seamless_login.DEFAULT_SITE).strip()
     try:
-        return await run_in_threadpool(seamless_login.start)
+        return await run_in_threadpool(seamless_login.start, site)
     except seamless_login.SeamlessLoginError as exc:
         raise HTTPException(status_code=502, detail=str(exc)[:240]) from exc
+
+
+@app.get("/admin/accounts/seamless-login/sites")
+async def admin_seamless_login_sites(authorization: str | None = Header(default=None)):
+    """可选的授权站点及其已导入账号数，供前端默认选中。"""
+    _check_admin(authorization)
+    return {"sites": await run_in_threadpool(seamless_login.available_sites)}
 
 
 @app.get("/admin/accounts/seamless-login/poll")

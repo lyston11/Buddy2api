@@ -182,3 +182,91 @@ def test_concurrent_poll_does_not_double_create_account(monkeypatch):
     assert sl.poll(login_id)["status"] == "done"
     rows = [a for a in db.list_accounts(provider="workbuddy") if a.get("uid") == "uid-race"]
     assert len(rows) == 1
+
+
+# ------------------------------------------------------------
+# 站点隔离（2026-09-21）：国内版与国际版的 OAuth 是两个 host，
+# platform 标识也不同。把国际版账号送去国内站授权会拿到错的凭据。
+# ------------------------------------------------------------
+
+def test_domestic_site_uses_cn_host_and_platform(monkeypatch):
+    fake = _fake_http([{"code": 0, "data": {"state": "st-cn"}}])
+    monkeypatch.setattr(sl, "_http_json", fake)
+
+    out = sl.start(sl.sites.SITE_DOMESTIC)
+
+    assert out["site"] == "domestic" and out["platform"] == "workbuddy"
+    assert fake.calls[0]["url"] == "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy"
+
+
+def test_international_site_uses_ai_host_and_platform(monkeypatch):
+    """国际版必须打 www.workbuddy.ai 且 platform=workbuddy-ai。
+
+    回归：原实现把 API_BASE 写死成 www.workbuddy.cn、platform 写死成 workbuddy，
+    国际版账号点「无感登录」会被送到国内站授权。
+    """
+    fake = _fake_http([{"code": 0, "data": {"state": "st-ai"}}])
+    monkeypatch.setattr(sl, "_http_json", fake)
+
+    out = sl.start(sl.sites.SITE_INTERNATIONAL)
+
+    assert out["site"] == "international" and out["platform"] == "workbuddy-ai"
+    assert fake.calls[0]["url"] == "https://www.workbuddy.ai/v2/plugin/auth/state?platform=workbuddy-ai"
+
+
+def test_poll_reuses_the_site_chosen_at_start(monkeypatch):
+    """轮询必须沿用发起时选定的站点，不能回落到默认国内站。"""
+    token_ok, account_ok = _token_response()
+    fake = _fake_http([{"code": 0, "data": {"state": "st-ai2"}}, token_ok, account_ok])
+    monkeypatch.setattr(sl, "_http_json", fake)
+    login_id = sl.start(sl.sites.SITE_INTERNATIONAL)["login_id"]
+
+    sl.poll(login_id)
+
+    polled = [c["url"] for c in fake.calls if "/auth/token" in c["url"] or "/login/account" in c["url"]]
+    assert polled, "应轮询 token 与 account 两个接口"
+    assert all(u.startswith("https://www.workbuddy.ai/") for u in polled), polled
+
+
+def test_unknown_site_falls_back_to_domestic(monkeypatch):
+    fake = _fake_http([{"code": 0, "data": {"state": "st-x"}}])
+    monkeypatch.setattr(sl, "_http_json", fake)
+    out = sl.start("no-such-site")
+    assert out["site"] == "no-such-site"  # 原样回显请求值
+    assert "www.workbuddy.cn" in fake.calls[0]["url"], "未知站点必须回落到默认站点"
+
+
+def test_domain_maps_to_site():
+    assert sl.site_for_domain("www.workbuddy.ai") == sl.sites.SITE_INTERNATIONAL
+    assert sl.site_for_domain("HTTPS://WWW.WorkBuddy.AI/") == sl.sites.SITE_INTERNATIONAL
+    assert sl.site_for_domain("www.workbuddy.cn") == sl.sites.SITE_DOMESTIC
+    assert sl.site_for_domain("www.codebuddy.cn") == sl.sites.SITE_DOMESTIC
+    assert sl.site_for_domain("") == sl.DEFAULT_SITE
+    assert sl.site_for_domain(None) == sl.DEFAULT_SITE
+
+
+def test_missing_domain_uses_the_selected_site_not_cn():
+    """上游没回 domain 时按选定站点兜底，不能一律写成国内站。"""
+    db.add_account({"name": "intl", "uid": "uid-intl", "access_token": "t",
+                    "domain": "www.workbuddy.ai"})
+    token = {"code": 0, "data": {"accessToken": "at", "refreshToken": "rt"}}  # 无 domain
+    account = {"uid": "uid-intl", "nickname": "intl"}
+
+    sl._write_credentials("uid-intl", token["data"], account, sl.sites.SITE_INTERNATIONAL)
+    row = next(a for a in db.list_accounts() if a.get("uid") == "uid-intl")
+    assert row["domain"] == "www.workbuddy.ai", "国际版账号不得被写成国内站域名"
+
+
+def test_available_sites_counts_accounts_per_site():
+    db.add_account({"name": "a", "uid": "u1", "access_token": "t", "domain": "www.workbuddy.ai"})
+    db.add_account({"name": "b", "uid": "u2", "access_token": "t", "domain": "www.workbuddy.cn"})
+    db.add_account({"name": "c", "uid": "u3", "access_token": "t", "domain": "www.workbuddy.cn"})
+
+    sites = {s["site"]: s for s in sl.available_sites()}
+
+    assert sites["international"]["account_count"] == 1
+    assert sites["international"]["api_host"] == "https://www.workbuddy.ai"
+    assert sites["international"]["platform"] == "workbuddy-ai"
+    assert sites["domestic"]["account_count"] == 2
+    assert sites["domestic"]["api_host"] == "https://www.workbuddy.cn"
+    assert sites["domestic"]["platform"] == "workbuddy"

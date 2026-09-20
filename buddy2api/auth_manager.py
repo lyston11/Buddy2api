@@ -694,10 +694,16 @@ def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
     accounts = db.list_accounts()
     existing_uids = {a.get("uid", "") for a in accounts if a.get("uid")}
     files = [_safe_auth_file_meta(f, existing_uids) for f in find_auth_files(auth_dir)]
+    # 这个发现流程只扫 WorkBuddy 的 auth 目录（*.info），凭据来源视图也必须只列
+    # WorkBuddy 账号 —— 否则 QClaw / TraeWork 账号会出现在面板里，并被标成
+    # 「仅数据库 · 刷新续期」，看起来像是丢了本机凭据。
+    workbuddy_accounts = [
+        a for a in accounts if str(a.get("provider") or "workbuddy") == "workbuddy"
+    ]
     return {
         "dirs": dirs,
         "files": files,
-        "accounts": _account_credential_sources(files, accounts),
+        "accounts": _account_credential_sources(files, workbuddy_accounts),
         "file_count": len(files),
         "backup_count": sum(1 for f in files if f.get("is_backup")),
         "valid_count": sum(1 for f in files if f.get("valid")),
