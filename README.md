@@ -154,6 +154,23 @@ python -m buddy2api
 
 选号顺序是「优先级 → 权重 → 窗口内请求数/权重少的先用」，同级账号之间还带一层粘性（同一模型尽量回上次的账号，保住 prompt cache），只有在粘住的账号比同级最空闲的多干了超过 1 个权重单位时才让位。
 
+### 账号被限额后，其它账号也用不了？
+
+上游限额（HTTP 429，WorkBuddy `code 6004`「使用量已超出频率限制」）是**按模型**算的，不是按账号：同一个账号在 deepseek 上被限额时，它在 glm 上照样能用。网关按这个语义处理：
+
+- 被限额的账号只会从**该模型**的候选里去掉（`CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS` 可调冷却，默认 900 秒），不影响它服务其它模型。冷却到点会自动再试一次，仍被限就重新计时。
+- 换号重试的账号数上限是 8（`CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS` 可调）。这是关键：以前固定试 3 个账号，账号多于 3 个时，前 3 次可能全撞在限额账号上，健康账号从头到尾没被选中——表现就是「明明还有能用的账号，却一直请求失败」。
+- 被限流的账号在冷却期内不会走「过期账号刷新」那条回退路径。
+- 把 Key 钉在某个具体账号上时，该账号正在这个模型上被限额会直接失败（绑定语义是「只用这个账号」，不会反复撞墙）。
+
+### 国际站工具续聊报 `code 11155`
+
+`code 11155`（`the reasoning content from the previous turn must be passed back in thinking mode`）在国际版（`www.workbuddy.ai`）有一个独立成因，**与 `reasoning_content` 无关**：国际站在思考模式下校验的字段名是 `reasoning`，而它自己在流式增量里下发的却是 `reasoning_content`——两者同名不同向。
+
+触发条件是「思考模式 + 请求带 `tools` + 最后一条消息不是 `user`（即续接一次未完成的回合）」，且最后一条 `user` 之后的第一条纯文本 assistant 消息（不带 `tool_calls`）缺 `reasoning` 或为空。最常见的就是工具回合续聊：`文本 assistant → tool_calls assistant → tool`。此时整请求会被上游拒绝。
+
+网关会自动为那一条消息补上 `reasoning`（有真实 `reasoning_content` 就镜像过去，否则用单个空格占位），其它消息一律不动。用 `CB_GATEWAY_REASONING_PASSTHROUGH=off` 可关闭这项改写。
+
 ### 同一个模型，国际号和国内号计费不一样
 
 国内版与国际版分开计费，而**「免费」是「模型 × 站点」的属性，不是站点的属性**：
@@ -272,6 +289,9 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_GATEWAY_AUTO_IMPORT` | 设 `1` 则启动时自动导入。默认 `0` |
 | `CB_GATEWAY_CHECKIN_GAP_MS` | 一键领取间隔，默认 `800` |
 | `CB_GATEWAY_ROUTE_WINDOW_SECONDS` | 选路负载统计窗口，默认 `900`（15 分钟）。窗口内服务请求少的账号先用 |
+| `CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS` | 账号被上游限额（429）后在该模型上的冷却时长，默认 `900`。按「账号 × 模型」记，不影响该账号服务其它模型 |
+| `CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS` | 一次请求最多换几个账号重试，默认 `8`。必须大于账号数，否则健康账号可能轮不到 |
+| `CB_GATEWAY_REASONING_PASSTHROUGH` | 设为 `off` 可关闭对历史 assistant 消息的推理字段改写（`reasoning_content` 占位与 `reasoning` 补齐） |
 | `CB_GATEWAY_DEFAULT_REASONING_EFFORT` | WorkBuddy DeepSeek V4 Pro/Flash 的默认思考强度，支持 `low` / `high` / `max`，默认 `high`；设为 `off` 可关闭默认值。Responses 的 `reasoning.effort` 或 Chat Completions 的 `reasoning_effort` 会覆盖它 |
 | `CB_AUTH_DIR` | WorkBuddy 登录目录 |
 | `CB_QCLAW_AUTH_DIR` | QClaw 登录目录 |

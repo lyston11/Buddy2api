@@ -448,6 +448,61 @@ def _ensure_reasoning_content_on_assistant_messages(messages, thinking_enabled: 
     return patched if changed else messages
 
 
+# 国际站（www.workbuddy.ai）在 thinking 模式下校验的字段名是 `reasoning`，不是它自己在
+# 流式增量里下发的 `reasoning_content` —— 两者同名不同向，实测（2026-09-20）：
+#   - 只有 reasoning_content（真内容也一样）→ 400 code 11155；
+#   - 改为/补上 reasoning                          → 200；
+#   - 两个都带（内容相同）                            → 200（国内站同样接受）。
+# 触发条件（逐项实测固定的结构规则）：thinking 模式开启、请求带 tools、最后一条消息
+# 不是 user（即正在续接一次未完成的回合），且「最后一条 user 之后的第一条纯文本
+# assistant 消息」（无 tool_calls）缺 reasoning 或为空。
+# 例如「文本 assistant → tool_calls assistant → tool」这个最常见的工具回合续聊，
+# 只要第一条 assistant 缺该字段就整请求被拒——这与 reasoning_content 无关，
+# 所以此前补 reasoning_content 的修法对它无效。
+# 占位值用单个空格：上游只要求字段非空，而空白不携带任何语义，对模型的干扰最小。
+_REASONING_FIELD_PLACEHOLDER = " "
+
+
+def _ensure_reasoning_field_for_continuation(messages, thinking_enabled: bool, has_tools: bool):
+    """给「最后一条 user 之后的首条纯文本 assistant 消息」补上非空 reasoning。
+
+    只改这一条：实测同一份请求，改动位置不对（例如把 reasoning 加在带 tool_calls 的
+    assistant 上、或加在最后一条 user 之前）都不能解决 11155。
+    """
+    if not thinking_enabled or not has_tools or not _reasoning_passthrough_enabled():
+        return messages
+    if not isinstance(messages, list) or not messages:
+        return messages
+    if isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+        # 最后一条是 user：这是新回合的开始，不需要回传上一轮的推理。
+        return messages
+
+    last_user = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user = index
+
+    for index in range(last_user + 1, len(messages)):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if message.get("tool_calls"):
+            # 带 tool_calls 的 assistant 不参与这条校验（给它加反而没用）。
+            continue
+        existing = str(message.get("reasoning") or "")
+        if existing.strip():
+            return messages
+        # 有真实推理就镜像过去（不造假）；否则用最小占位值满足上游的非空要求。
+        source = str(message.get("reasoning_content") or "")
+        patched = list(messages)
+        patched[index] = {
+            **message,
+            "reasoning": source if source.strip() else _REASONING_FIELD_PLACEHOLDER,
+        }
+        return patched
+    return messages
+
+
 def build_backend_body(payload: dict) -> dict:
     reasoning_control = resolve_reasoning_control(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
@@ -482,9 +537,17 @@ def build_backend_body(payload: dict) -> dict:
     # 思考模式下上游要求回传 reasoning_content，缺失会导致 11155。
     # 放在这里是因为此时 reasoning_effort 才最终确定。
     if isinstance(body.get("messages"), list):
+        thinking_enabled = _thinking_mode_enabled(body.get("reasoning_effort"))
         body["messages"] = _ensure_reasoning_content_on_assistant_messages(
             body["messages"],
-            _thinking_mode_enabled(body.get("reasoning_effort")),
+            thinking_enabled,
+        )
+        # 国际站校验的是 `reasoning` 字段名（见该函数注释），与上面补 reasoning_content
+        # 是两件事：这条不修，工具回合续聊在国际站会被 11155 整请求拒绝。
+        body["messages"] = _ensure_reasoning_field_for_continuation(
+            body["messages"],
+            thinking_enabled,
+            has_tools=bool(body.get("tools")),
         )
     body["stream"] = True
     if "stream_options" not in body:
@@ -1070,7 +1133,9 @@ async def _json_chat_with_stall_retry(
     model_name: str,
 ) -> tuple:
     tried_ids: set[int] = set()
-    max_retries = 3
+    # 重试额度必须大于「可用账号数」：按模型限流时，前几个账号可能都在限额中，
+    # 固定 3 次会让健康账号永远轮不到（见 MAX_ACCOUNT_ATTEMPTS 的注释）。
+    max_retries = max(3, auth_manager.MAX_ACCOUNT_ATTEMPTS)
     last_error = None
 
     for attempt in range(max_retries):
@@ -1109,9 +1174,9 @@ async def _json_chat_with_stall_retry(
                         retry_choice = (retry_result[1].get("choices") or [{}])[0]
                         retry_message = retry_choice.get("message") or {}
                         if retry_message.get("tool_calls"):
-                            auth_manager.mark_account_success(account["id"])
+                            auth_manager.mark_account_success(account["id"], body.get("model"))
                             return retry_result
-            auth_manager.mark_account_success(account["id"])
+            auth_manager.mark_account_success(account["id"], body.get("model"))
             return result
 
         last_error = result
@@ -1123,7 +1188,7 @@ async def _json_chat_with_stall_retry(
         if model_blocked:
             auth_manager.mark_model_denied(account["id"], body.get("model"))
         else:
-            auth_manager.mark_account_failure(account["id"], err_status)
+            auth_manager.mark_account_failure(account["id"], err_status, body.get("model"))
         will_retry = (
             model_blocked or _is_retryable_status(err_status)
         ) and attempt < max_retries - 1
@@ -1279,8 +1344,11 @@ async def _stream_upstream(
     last_account = None
     last_started = time.time()
     pending_retry_log: dict | None = None
+    # 同 _json_chat_with_stall_retry：重试额度要大于可用账号数，否则健康账号会被
+    # 一批正在限流的账号挤在窗口外。
+    max_attempts = max(3, auth_manager.MAX_ACCOUNT_ATTEMPTS)
 
-    for attempt in range(3):
+    for attempt in range(max_attempts):
         account = await auth_manager.pick_account_with_fallback(
             tried_ids, model=body.get("model")
         )
@@ -1361,11 +1429,11 @@ async def _stream_upstream(
                             )
                         else:
                             auth_manager.mark_account_failure(
-                                account["id"], response.status_code
+                                account["id"], response.status_code, body.get("model")
                             )
                         if (
                             model_blocked or _is_retryable_status(response.status_code)
-                        ) and attempt < 2:
+                        ) and attempt < max_attempts - 1:
                             pending_retry_log = {
                                 "account": account,
                                 "prompt_tokens": 0,
@@ -1431,8 +1499,8 @@ async def _stream_upstream(
             last_error_event = None
             last_status = 502
             last_failure = failure
-            auth_manager.mark_account_failure(account["id"], 502)
-            if not output_started and attempt < 2:
+            auth_manager.mark_account_failure(account["id"], 502, body.get("model"))
+            if not output_started and attempt < max_attempts - 1:
                 pending_retry_log = {
                     "account": account,
                     "prompt_tokens": 0,
@@ -1489,8 +1557,8 @@ async def _stream_upstream(
             last_error_event = observer.upstream_error_event
             last_status = 502
             last_failure = failure
-            auth_manager.mark_account_failure(account["id"], 502)
-            if not output_started and attempt < 2:
+            auth_manager.mark_account_failure(account["id"], 502, body.get("model"))
+            if not output_started and attempt < max_attempts - 1:
                 pending_retry_log = {
                     "account": account,
                     "prompt_tokens": observer.usage.get("prompt_tokens", 0),
@@ -1527,7 +1595,7 @@ async def _stream_upstream(
                 index: "tool_calls" if index in observer.tool_call_choices else "stop"
                 for index in missing_choices
             })
-        auth_manager.mark_account_success(account["id"])
+        auth_manager.mark_account_success(account["id"], body.get("model"))
 
         full_text = "".join(observer.content_parts)
         audit_blocked = _looks_like_audit_block(full_text)

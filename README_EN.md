@@ -83,6 +83,23 @@ The **Requests** column in the accounts table is a **lifetime** counter. It only
 
 Within a priority tier the order is weight first, then least in-window requests per weight, with a stickiness layer on top: the same model prefers to return to its previous account to preserve the prompt cache, and only yields once that account has served more than one weight unit beyond the idlest peer.
 
+### Other accounts unusable after one account hits its quota?
+
+Upstream quota errors (HTTP 429, WorkBuddy `code 6004` "usage exceeds frequency limit") are tracked **per model**, not per account: while an account is rate-limited on deepseek it can still serve glm. The gateway follows that semantics:
+
+- A rate-limited account is removed from the candidate pool for **that model only** (cooldown tunable with `CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS`, default 900s) and keeps serving every other model. When the cooldown expires the gateway tries it again; if it is still limited the timer restarts.
+- The failover retry budget is 8 accounts (`CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS`). This is the important part: with the old fixed budget of 3, a pool larger than 3 could burn every attempt on rate-limited accounts and never reach a healthy one — which shows up as "there are working accounts, yet requests keep failing".
+- A rate-limited account is also excluded from the "refresh expired accounts" fallback path.
+- When a key is pinned to a specific account and that account is rate-limited on the model, the request fails outright (pinning means "use this account only", not "keep hammering it").
+
+### International site tool-turn continuations fail with `code 11155`
+
+On the international site (`www.workbuddy.ai`), `code 11155` (`the reasoning content from the previous turn must be passed back in thinking mode`) has a separate cause that has **nothing to do with `reasoning_content`**: in thinking mode the international site validates a field named `reasoning`, while the field it streams back is called `reasoning_content` — same name, opposite direction.
+
+The trigger is "thinking mode + the request carries `tools` + the last message is not a `user` message (i.e. continuing an unfinished turn)", with the first plain-text assistant message (no `tool_calls`) after the last `user` message missing or having an empty `reasoning`. The common case is a tool-turn continuation: `text assistant → tool_calls assistant → tool`. The upstream rejects the entire request.
+
+The gateway fills in `reasoning` for that one message (mirroring a real `reasoning_content` when present, otherwise a single-space placeholder) and leaves every other message untouched. Set `CB_GATEWAY_REASONING_PASSTHROUGH=off` to disable this rewrite.
+
 ### The same model costs different amounts on the international and domestic sites
 
 The international and domestic editions are billed separately, and **“free” is a property of the model × site pair, not of the site**:
@@ -148,7 +165,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## Environment
 
-`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_GATEWAY_ROUTE_WINDOW_SECONDS` (default `900`, the load-averaging window used for account selection), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_TRAEWORK_OS_INFO` (the `OSInfo` reported on TraeWork refresh; Windows `windows`, macOS `mac`, Linux `linux`), `CB_TRAEWORK_DEVICE_NAME`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
+`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_GATEWAY_ROUTE_WINDOW_SECONDS` (default `900`, the load-averaging window used for account selection), `CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS` (default `900`, how long an account is skipped for a model after a 429; tracked per account+model), `CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS` (default `8`, how many accounts a single request may fail over through), `CB_GATEWAY_REASONING_PASSTHROUGH` (set `off` to disable the historical-assistant reasoning field rewrites), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_TRAEWORK_OS_INFO` (the `OSInfo` reported on TraeWork refresh; Windows `windows`, macOS `mac`, Linux `linux`), `CB_TRAEWORK_DEVICE_NAME`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
 
 `CB_GATEWAY_DEFAULT_REASONING_EFFORT` controls the default reasoning effort for WorkBuddy DeepSeek V4 Pro/Flash. It accepts `low`, `high`, or `max`, defaults to `high`, and can be disabled with `off`. A Responses `reasoning.effort` or Chat Completions `reasoning_effort` value overrides the default.
 

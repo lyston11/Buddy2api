@@ -38,6 +38,7 @@ def _clear_route_state():
     def _reset():
         auth_manager._sticky_account_id.clear()
         auth_manager._account_failures.clear()
+        auth_manager._model_rate_limits.clear()
         auth_manager._auth_failures.clear()
         auth_manager._verify_inflight.clear()
         auth_manager._account_models.clear()
@@ -692,3 +693,147 @@ def test_reset_request_counts_levels_the_field():
         picks.append(chosen)
         _serve(chosen)
     assert set(picks) == {a, b}, picks
+
+
+# ============================================================
+# 按模型限流（429 / code 6004）不得把健康账号挤出重试窗口
+#
+# 实测背景（2026-09-20）：4 个老账号在 deepseek-v4.1-flash 上被上游限流
+# （`{"code":6004,"msg":"usage exceeds frequency limit ... 您也可以切换其他模型
+# 继续使用"}`，重置窗口 1~6 小时），另加了 2 个健康账号，但客户端仍然请求不了
+# deepseek —— 请求每次都在 3 次重试里撞限额账号，健康账号从未被选中。
+#
+# 两个成因，两条回归：
+#   1. 429 与其它失败共用 30s×2ⁿ、封顶 300s 的冷却，冷却一过，被限流的账号就以
+#      「零负载」身份回到候选池最前（负载只统计 2xx），再次霸占重试额度；
+#   2. 重试上限硬编码 3 次，账号多于 3 个时健康账号根本没有出场机会。
+# ============================================================
+
+def test_rate_limited_account_is_skipped_for_that_model():
+    """被限流的账号必须从本模型的候选里去掉，而不是只降优先级。
+
+    只降优先级不够：负载排序看 2xx，限额账号的负载是 0（它一直失败、从没服务成功），
+    在排序上反而「最空闲」，每次重试都会被优先选中。
+    """
+    limited = _make_account("limited", "www.workbuddy.cn")
+    healthy = _make_account("healthy", "www.workbuddy.cn")
+
+    auth_manager.mark_account_failure(limited, 429, "deepseek-v4.1-flash")
+
+    for _ in range(6):
+        assert auth_manager.pick_account(model="deepseek-v4.1-flash")["id"] == healthy
+
+
+def test_rate_limit_is_per_model_not_per_account():
+    """限流只锁「该账号 + 该模型」：该账号在其它模型上必须照常可用。
+
+    回归点：按账号整体冷却会把账号在其它模型上的正常服务一起堵掉。实测数据支持
+    按模型限流 —— 账号在 deepseek 上吃 429 后十几分钟内仍在正常服务 glm-5.3-flash，
+    上游报文也明确写「您也可以切换其他模型继续使用」。
+    """
+    a = _make_account("a", "www.workbuddy.cn")
+
+    auth_manager.mark_account_failure(a, 429, "deepseek-v4.1-flash")
+
+    assert auth_manager.account_model_rate_limited(a, "deepseek-v4.1-flash") is True
+    assert auth_manager.account_model_rate_limited(a, "glm-5.3-flash") is False
+    assert auth_manager.pick_account(model="glm-5.3-flash")["id"] == a
+    # 同一账号在别的模型上仍然「不冷却」—— 账号级冷却没有被触发
+    assert auth_manager.account_is_cooling_down(a) is False
+
+
+def test_rate_limit_cooldown_outlasts_plain_backoff():
+    """限流冷却必须长于通用退避（30s/60s/.../300s），否则冷却形同虚设。
+
+    上游给的重置窗口是分钟到小时级（实测「将在 18:26 重置」距报错 1h44m）。
+    """
+    a = _make_account("a", "www.workbuddy.cn")
+    auth_manager.mark_account_failure(a, 429, "m")
+    expires = auth_manager._model_rate_limits[(a, "m")]
+    remaining = expires - time.monotonic()
+    assert remaining >= auth_manager.RATE_LIMIT_COOLDOWN_SECONDS - 1
+    assert auth_manager.RATE_LIMIT_COOLDOWN_SECONDS > 300, "冷却不能短于通用退避上限"
+
+
+def test_success_clears_the_model_rate_limit():
+    """模型上真的成功了就立刻解除冷却，不等计时器走完。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    auth_manager.mark_account_failure(a, 429, "m")
+    assert auth_manager.account_model_rate_limited(a, "m") is True
+
+    auth_manager.mark_account_success(a, "m")
+
+    assert auth_manager.account_model_rate_limited(a, "m") is False
+
+
+def test_all_candidates_limited_still_returns_an_account():
+    """全部候选都在限流时仍要返回账号，不能报 No available accounts。
+
+    宁可让上游再判一次（说不定额度已恢复），也不能让一个「明明有账号」的请求
+    直接失败。
+    """
+    a = _make_account("a", "www.workbuddy.cn")
+    b = _make_account("b", "www.workbuddy.cn")
+    for aid in (a, b):
+        auth_manager.mark_account_failure(aid, 429, "m")
+
+    chosen = auth_manager.pick_account(model="m")
+    assert chosen is not None and chosen["id"] in {a, b}
+
+
+def test_rate_limit_does_not_exclude_accounts_in_expired_refresh_fallback():
+    """限流账号也不走「过期账号刷新」回退路径（否则限流立刻被绕过）。"""
+    limited = _make_account("limited", "www.workbuddy.cn", status="expired")
+    auth_manager.mark_account_failure(limited, 429, "m")
+
+    assert auth_manager.pick_account(model="m") is None
+
+
+def test_pinned_account_reports_unavailable_while_rate_limited():
+    """绑定账号在限流中时返回 None：绑定语义是「只用这个账号」，不是反复撞墙。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    auth_manager.set_pinned_account(a)
+    try:
+        assert auth_manager.pick_account(model="m") is not None
+        auth_manager.mark_account_failure(a, 429, "m")
+        assert auth_manager.pick_account(model="m") is None
+    finally:
+        auth_manager.set_pinned_account(0)
+
+
+def test_retry_budget_exceeds_account_pool(monkeypatch):
+    """换号重试的账号数上限必须大于账号池规模。
+
+    这是本次事故的直接原因：6 个账号、重试上限 3，前 3 次全撞在限额账号上，
+    健康账号从头到尾没被试过。这里用真实选路跑一遍，断言最终落到健康账号。
+    """
+    limited = [_make_account(f"limited-{i}", "www.workbuddy.cn") for i in range(4)]
+    healthy = _make_account("healthy", "www.workbuddy.cn")
+    for aid in limited:
+        auth_manager.mark_account_failure(aid, 429, "m")
+
+    tried: set[int] = set()
+    attempts = 0
+    while attempts < auth_manager.MAX_ACCOUNT_ATTEMPTS:
+        account = auth_manager.pick_account(tried, model="m")
+        if not account:
+            break
+        tried.add(account["id"])
+        attempts += 1
+        if account["id"] == healthy:
+            break
+
+    assert healthy in tried, f"健康账号必须有机会出场，实际试过 {tried}"
+    assert auth_manager.MAX_ACCOUNT_ATTEMPTS > len(limited), "上限必须大于账号池规模"
+
+
+def test_rate_limit_state_is_swept_when_account_is_deleted():
+    """账号删除后清掉它的限流状态，别留成内存泄漏。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    auth_manager.mark_account_failure(a, 429, "m")
+    assert (a, "m") in auth_manager._model_rate_limits
+
+    db.delete_account(a)
+    auth_manager.forget_account(a)
+
+    assert (a, "m") not in auth_manager._model_rate_limits

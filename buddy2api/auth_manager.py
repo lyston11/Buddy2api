@@ -44,6 +44,31 @@ _route_lock = threading.Lock()
 _sticky_account_id: dict[str, int] = {}
 _failure_lock = threading.Lock()
 _account_failures: dict[int, tuple[int, float]] = {}
+# 按 (账号, 模型) 的限流冷却。与 _account_failures 分开存：前者是「这个账号这个
+# 模型暂时没额度」，不影响该账号服务其它模型；后者是账号级别的失败退避。
+_rate_limit_lock = threading.Lock()
+_model_rate_limits: dict[tuple[int, str], float] = {}
+
+# 429（WorkBuddy code 6004「使用量已超出频率限制」）不是瞬时抖动，而是额度用尽：
+# 上游报文明确说「您也可以切换其他模型继续使用」。实测 2026-09-20：
+#   - 账号在 deepseek 上吃 429 后，十几分钟内仍在正常服务 glm-5.3-flash；
+#   - 重置窗口是分钟到小时级（国内账号回「将在 18:26 重置」，距报错 1h44m）。
+# 所以限流必须【按模型】冷却，不能按账号：
+#   - 按账号冷却会把该账号在其它模型上的正常服务一起堵掉（回归）；
+#   - 用通用的 30s×2ⁿ、封顶 300s 退避又太短 —— 冷却一过，被限流的账号就以
+#     「零负载」的身份回到候选池最前面（负载只统计 2xx），把健康账号挤出重试
+#     窗口。这正是「四个老账号限额后，新账号明明可用却请求不到」的成因。
+# 这里取一个保守下限（小于上游给出的真实重置窗口）：到期后再试一次，若仍被限
+# 就重新计时，自愈且不会像「按报文直接封到几小时后」那样误判。
+RATE_LIMIT_COOLDOWN_SECONDS = int(
+    os.environ.get("CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS", "900")
+)
+
+# 换号重试的账号数上限。必须大于「可用账号数」才能保证轮到健康账号：
+# 3 个账号时试 3 个够用，但 6 个账号时限额账号会先把 3 次机会占满。
+# pick_account 在候选耗尽时返回 None，循环会提前 break，所以给足上限是安全的
+# —— 实际尝试次数仍受可用账号数约束，不会空转。
+MAX_ACCOUNT_ATTEMPTS = int(os.environ.get("CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS", "8"))
 
 # API Key 级账号绑定：0 = 不绑定（走优先级 + 粘性调度），>0 = 只用该 accounts.id。
 # 用 contextvars 而不是给 pick_account 加参数：这样 providers/* 与 proxy.py 的调用
@@ -265,13 +290,49 @@ def auth_failure_count(aid: int) -> int:
         return _auth_failures.get(aid, 0)
 
 
-def mark_account_success(aid: int):
+def mark_account_success(aid: int, model: Optional[str] = None):
     with _failure_lock:
         _account_failures.pop(aid, None)
+    if model is not None:
+        clear_model_rate_limit(aid, model)
     _reset_auth_failure(aid)
 
 
-def mark_account_failure(aid: int, status_code: int = 0):
+def _normalize_route_model(model) -> str:
+    return str(model or "").strip()
+
+
+def clear_model_rate_limit(aid: int, model) -> None:
+    """解除某账号在某模型上的限流冷却（请求真的成功了）。"""
+    key = (aid, _normalize_route_model(model))
+    with _rate_limit_lock:
+        _model_rate_limits.pop(key, None)
+
+
+def account_model_rate_limited(aid: int, model) -> bool:
+    """该账号在该模型上是否还在限流冷却中。"""
+    mid = _normalize_route_model(model)
+    if not mid:
+        return False
+    key = (aid, mid)
+    with _rate_limit_lock:
+        expires = _model_rate_limits.get(key)
+        if expires is None:
+            return False
+        if expires <= time.monotonic():
+            _model_rate_limits.pop(key, None)
+            return False
+        return True
+
+
+def mark_account_failure(aid: int, status_code: int = 0, model: Optional[str] = None):
+    # 限流是模型级的（上游提示「可切换其他模型继续使用」）：只给这个模型打冷却，
+    # 账号本身是好的，不记账号级失败 —— 否则该账号在其它模型上的正常服务也会被堵住。
+    if status_code == 429 and _normalize_route_model(model):
+        key = (aid, _normalize_route_model(model))
+        with _rate_limit_lock:
+            _model_rate_limits[key] = time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
+        return
     with _failure_lock:
         count, _ = _account_failures.get(aid, (0, 0.0))
         count += 1
@@ -1452,6 +1513,9 @@ def forget_account(aid: int) -> None:
                 _sticky_account_id.pop(key, None)
     with _failure_lock:
         _account_failures.pop(aid, None)
+    with _rate_limit_lock:
+        for key in [k for k in _model_rate_limits if k[0] == aid]:
+            _model_rate_limits.pop(key, None)
     _reset_auth_failure(aid)
 
 
@@ -1562,7 +1626,7 @@ def pinned_account_id() -> int:
         return 0
 
 
-def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str) -> Optional[dict]:
+def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str, model: Optional[str] = None) -> Optional[dict]:
     """绑定账号时的选择逻辑：只认这一个账号，不可用就返回 None。
 
     刻意不做「换个账号重试」：Key 绑定账号的语义就是「这把 Key 只花这个账号的额度」，
@@ -1576,6 +1640,10 @@ def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str) -> Opti
     if str(target.get("provider") or "workbuddy") != provider:
         return None
     if str(target.get("status") or "") != "active":
+        return None
+    # 绑定的账号正在这个模型上被限流时也返回 None：绑定语义是「只用这个账号」，
+    # 不是「无视它的限流状态反复撞墙」。
+    if model and account_model_rate_limited(aid, model):
         return None
     return target
 
@@ -1595,8 +1663,12 @@ def pick_account(
     的终身累计计数 —— 后者只增不减，历史欠债会让「少的先用」退化成「永远只用计数
     最低的那个」，看起来就像固定路由到一个账号。
 
-    两道过滤都只调整优先级、不清空候选（能力过滤在有能力账号时生效，站点偏好在偏好
-    站点有账号时生效），否则会出现「明明有账号，却报 No available accounts」。
+    过滤分两类，绝不能混为一谈：
+      - 硬过滤（排除候选）：调用方显式排除、账号正在冷却、账号被隔离、
+        **该账号在该模型上正在限流冷却**。这些情况下选它只会重演同一次失败。
+      - 软过滤（只调优先级）：能力未知、站点偏好。
+    限流冷却属于前者，且必须参与候选计算：否则请求会反复选中同一个正在被限流的
+    账号、把换号重试的次数耗尽，而真正健康的账号从头到尾没被试过。
 
     最后：API Key 若绑定了账号（default_account>0），只返回那个账号。绑定优先于所有
     调度规则 —— 它存在的意义就是让调用方指定用哪个账号。
@@ -1604,7 +1676,7 @@ def pick_account(
     exclude_ids = exclude_ids or set()
     pinned = pinned_account_id()
     if pinned:
-        return _pick_pinned_account(pinned, exclude_ids, provider)
+        return _pick_pinned_account(pinned, exclude_ids, provider, model)
     accounts = db.get_active_accounts(provider)
     candidates = [
         a for a in accounts
@@ -1616,6 +1688,12 @@ def pick_account(
         return None
 
     if model:
+        # 限流按模型记：同一个账号在别的模型上可能完全正常，所以只把它从本模型的
+        # 候选里去掉。若全部候选都在限流，保留原候选（宁可让上游再判一次，也不要
+        # 报 No available accounts）。
+        not_limited = [a for a in candidates if not account_model_rate_limited(a["id"], model)]
+        if not_limited:
+            candidates = not_limited
         capable = [a for a in candidates if account_supports_model(a["id"], model)]
         # 已知全都不支持时保留原候选：让上游来判，顺便把结论学回来
         if capable:
@@ -1684,6 +1762,8 @@ async def pick_account_with_fallback(
         # 被隔离的账号同样不参与「过期账号刷新」这条回退路径：否则它会先被刷新、
         # 再以 active 身份回到候选池，隔离就形同虚设。
         if is_route_excluded(a):
+            continue
+        if model and account_model_rate_limited(a["id"], model):
             continue
         if model and not account_supports_model(a["id"], model):
             continue

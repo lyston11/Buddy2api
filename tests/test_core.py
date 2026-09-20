@@ -509,7 +509,7 @@ def _collect_chat_proxy_stream(
 
     monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
     monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _account_id: None)
+    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _account_id, _model=None: None)
     monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_args: None)
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
@@ -611,12 +611,12 @@ def _install_chat_account_stream_fakes(
     monkeypatch.setattr(
         auth_manager,
         "mark_account_failure",
-        lambda account_id, status=0: calls["failures"].append((account_id, status)),
+        lambda account_id, status=0, model=None: calls["failures"].append((account_id, status)),
     )
     monkeypatch.setattr(
         auth_manager,
         "mark_account_success",
-        lambda account_id: calls["successes"].append(account_id),
+        lambda account_id, model=None: calls["successes"].append(account_id),
     )
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
@@ -680,7 +680,7 @@ def _install_sequenced_stream_fakes(monkeypatch, streams: list[list[bytes]]) -> 
 
     monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
     monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
+    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id, _model=None: None)
     monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
@@ -3507,7 +3507,7 @@ def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
     monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
     monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
     monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
+    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id, _model=None: None)
     monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
@@ -3557,7 +3557,7 @@ def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkey
     monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
     monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
     monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
+    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id, _model=None: None)
     monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
@@ -3780,3 +3780,158 @@ def test_stream_tool_stall_is_logged(monkeypatch, isolated_db):
     assert b"tool stall" not in raw
     logged_finishes = [entry[0][8] for entry in calls["logs"]]
     assert "tool_stall" in logged_finishes
+
+
+# ============================================================
+# 国际站 thinking 模式下校验 `reasoning` 字段（不是它自己下发的 reasoning_content）
+#
+# 实测（2026-09-20，www.workbuddy.ai）：
+#   同一份请求体，只带 reasoning_content（哪怕是真的推理内容）→ 400 code 11155；
+#   改带/补上 `reasoning`                                        → 200；
+#   两个都带                                                     → 200（国内站同样接受）。
+# 触发条件：thinking 模式 + 请求带 tools + 最后一条消息不是 user（续接未完成的回合），
+# 且「最后一条 user 之后的首条纯文本 assistant 消息」缺 reasoning 或为空。
+# 典型现场是「文本 assistant → tool_calls assistant → tool」的工具回合续聊。
+# ============================================================
+
+_TOOLS = [{"type": "function", "function": {"name": "t", "parameters": {"type": "object"}}}]
+_CALL = [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}]
+
+
+def _build(payload):
+    return proxy.build_backend_body({
+        "model": "deepseek-v4-flash",
+        "reasoning_effort": "medium",
+        **payload,
+    })
+
+
+def test_reasoning_field_is_filled_for_tool_turn_continuation(monkeypatch):
+    """事故现场：文本 assistant → tool_calls assistant → tool，首条 assistant 缺 reasoning。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = _build({
+        "tools": _TOOLS,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "先说一句"},
+            {"role": "assistant", "content": None, "tool_calls": _CALL},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ],
+    })
+
+    text_assistant = body["messages"][-3]
+    assert text_assistant["role"] == "assistant"
+    assert text_assistant["reasoning"] == " "
+    # 带 tool_calls 的那条不加：实测加它没用，少改一个字段就少一份协议风险。
+    assert "reasoning" not in body["messages"][-2]
+
+
+def test_real_reasoning_content_is_mirrored_into_reasoning_field(monkeypatch):
+    """有真实推理内容就镜像过去，不造假、也不丢信息。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = _build({
+        "tools": _TOOLS,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "先说一句", "reasoning_content": "我想先打个招呼"},
+            {"role": "assistant", "content": None, "tool_calls": _CALL},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ],
+    })
+
+    assert body["messages"][-3]["reasoning"] == "我想先打个招呼"
+
+
+def test_existing_reasoning_field_is_left_untouched(monkeypatch):
+    """客户端自己带了非空 reasoning 就不要覆盖它。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = _build({
+        "tools": _TOOLS,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "先说一句", "reasoning": "客户端自己的推理"},
+            {"role": "assistant", "content": None, "tool_calls": _CALL},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ],
+    })
+
+    assert body["messages"][-3]["reasoning"] == "客户端自己的推理"
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        ("最后一条是 user（新回合）", {
+            "tools": _TOOLS,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "上一轮的回答"},
+                {"role": "user", "content": "再问一句"},
+            ],
+        }),
+        ("未开启思考模式", {
+            "tools": _TOOLS,
+            "reasoning_effort": "none",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "回答"},
+            ],
+        }),
+        ("请求没带 tools", {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "回答"},
+            ],
+        }),
+    ],
+)
+def test_reasoning_field_not_filled_outside_the_trigger(monkeypatch, label, payload):
+    """只在实测确认的触发条件下补字段，其余情况一个字节都不改。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = _build(payload)
+
+    assert all("reasoning" not in m for m in body["messages"]), label
+
+
+def test_reasoning_field_fill_can_be_disabled(monkeypatch):
+    """CB_GATEWAY_REASONING_PASSTHROUGH=off 时要一并关掉这条改写。"""
+    monkeypatch.setenv("CB_GATEWAY_REASONING_PASSTHROUGH", "off")
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = _build({
+        "tools": _TOOLS,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "先说一句"},
+            {"role": "assistant", "content": None, "tool_calls": _CALL},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ],
+    })
+
+    assert all("reasoning" not in m for m in body["messages"])
+
+
+def test_blank_reasoning_counts_as_missing(monkeypatch):
+    """空白 reasoning 与缺失等价（实测空白能过、空串不能过，这里按空串处理再补）。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = _build({
+        "tools": _TOOLS,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "先说一句", "reasoning": ""},
+            {"role": "assistant", "content": None, "tool_calls": _CALL},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ],
+    })
+
+    assert body["messages"][-3]["reasoning"] == " "
