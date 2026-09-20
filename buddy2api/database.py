@@ -1295,13 +1295,74 @@ def get_stats() -> dict:
             "credits": 0,
         }))
 
-    # 模型使用统计
-    model_stats = conn.execute("""
-        SELECT model, COUNT(*) as count, COALESCE(SUM(total_tokens),0) as tokens,
+    # 模型使用统计。logs.model 存的是请求时的原始名，其中 `@后缀` 是账号隔离
+    # 用的手工别名（都映射到同一物理模型），直接 GROUP BY 会把一个模型拆成
+    # 多行，裸名行也看不出流量落在哪些账号。这里取全量原始行，用别名表
+    # 归一合并后再取 Top10，并附带 model × account 分布供前端下钻。
+    model_rows = conn.execute("""
+        SELECT model, provider, COUNT(*) as count, COALESCE(SUM(total_tokens),0) as tokens,
                COALESCE(SUM(credit),0) as credit,
                COALESCE(AVG(duration_ms),0) as avg_duration_ms
-        FROM logs GROUP BY model ORDER BY count DESC LIMIT 10
+        FROM logs GROUP BY model, provider
     """).fetchall()
+    model_account_rows = conn.execute("""
+        SELECT model, provider, account_id, COALESCE(account_name,'') as account_name,
+               COUNT(*) as count, MAX(created_at) as last_used_at
+        FROM logs GROUP BY model, provider, account_id, account_name
+    """).fetchall()
+
+    # 惰性导入：aliases 在模块层 import database，这里运行期再导入避免环
+    from buddy2api.aliases import canonical_model_name
+
+    merged: dict[str, dict] = {}
+    accounts_by_model: dict[str, dict] = {}
+    for row in model_account_rows:
+        base = canonical_model_name(row["provider"] or "workbuddy", row["model"])
+        bucket = accounts_by_model.setdefault(base, {})
+        if row["account_id"]:
+            key = ("id", row["account_id"])
+        else:
+            key = ("name", row["account_name"] or "")
+        entry = bucket.get(key)
+        if entry is None:
+            display = row["account_name"] or (f"#{row['account_id']}" if row["account_id"] else "未知账号")
+            entry = {"id": row["account_id"], "name": display, "count": 0, "last_used_at": 0}
+            bucket[key] = entry
+        entry["count"] += int(row["count"] or 0)
+        last_seen = int(row["last_used_at"] or 0)
+        # 同一账号改名后日志里会并存两个名字，以最近一次用的为准
+        if last_seen >= entry["last_used_at"] and row["account_name"]:
+            entry["name"] = row["account_name"]
+        entry["last_used_at"] = max(entry["last_used_at"], last_seen)
+
+    for row in model_rows:
+        base = canonical_model_name(row["provider"] or "workbuddy", row["model"])
+        entry = merged.get(base)
+        if entry is None:
+            entry = {"count": 0, "tokens": 0, "credit": 0.0, "weighted_duration": 0.0}
+            merged[base] = entry
+        count = int(row["count"] or 0)
+        entry["count"] += count
+        entry["tokens"] += int(row["tokens"] or 0)
+        entry["credit"] += float(row["credit"] or 0)
+        # 平均耗时按请求数加权合并，各组的 AVG 不能直接相加
+        entry["weighted_duration"] += float(row["avg_duration_ms"] or 0) * count
+
+    model_stats = []
+    for base, entry in sorted(merged.items(), key=lambda kv: kv[1]["count"], reverse=True)[:10]:
+        count = entry["count"] or 1
+        accounts = sorted(
+            accounts_by_model.get(base, {}).values(),
+            key=lambda a: a["count"], reverse=True,
+        )
+        model_stats.append({
+            "model": base,
+            "count": entry["count"],
+            "tokens": entry["tokens"],
+            "credit": round(entry["credit"], 4),
+            "avg_duration_ms": round(entry["weighted_duration"] / count),
+            "accounts": accounts[:8],
+        })
 
     key_stats = conn.execute("""
         SELECT api_key_name as name, COUNT(*) as count, COALESCE(SUM(total_tokens),0) as tokens,
@@ -1356,7 +1417,7 @@ def get_stats() -> dict:
         "active_keys": active_keys,
         "total_keys": total_keys,
         "daily": daily,
-        "model_stats": [dict(r) for r in model_stats],
+        "model_stats": model_stats,
         "key_stats": [dict(r) for r in key_stats],
         "account_stats": [dict(r) for r in account_stats],
         "recent_logs": [dict(r) for r in recent_logs],

@@ -119,6 +119,9 @@ badge,.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;bord
 .rank-name{font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rank-meta{font-size:11px;color:var(--fg3);margin-top:3px}
 .rank-value{text-align:right;font-family:var(--mono);font-size:12px;color:var(--fg2)}
+.rank-accts{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.acct-chip{font-size:10px;font-family:var(--mono);color:var(--fg3);background:var(--bg);border:1px solid var(--border2);border-radius:8px;padding:1px 6px;display:inline-flex;gap:4px;align-items:center;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acct-chip em{font-style:normal;color:var(--fg2)}
 .quick{display:grid;gap:10px}
 .quick-row{display:grid;grid-template-columns:88px 1fr auto;gap:8px;align-items:center}
 .quick-row .qk{font-size:11px;color:var(--fg3);text-transform:uppercase;letter-spacing:.3px}
@@ -728,7 +731,13 @@ const app=createApp({
         </div>
         <div class="card-p rank-list" v-if="s.model_stats?.length" style="padding-top:0">
           <div class="rank-item" v-for="m in s.model_stats" :key="m.model">
-            <div><div class="rank-name"><code>{{m.model}}</code></div><div class="rank-meta">{{tok(m.tokens)}} tokens · {{money(m.credit)}} credit · {{ms(m.avg_duration_ms)}}</div></div>
+            <div>
+              <div class="rank-name"><code>{{m.model}}</code></div>
+              <div class="rank-meta">{{tok(m.tokens)}} tokens · {{money(m.credit)}} credit · {{ms(m.avg_duration_ms)}}</div>
+              <div class="rank-accts" v-if="m.accounts?.length">
+                <span class="acct-chip" v-for="a in m.accounts" :key="(a.id||'x')+'-'+a.name" :title="a.name+' · '+n(a.count)+' req'">{{a.name}}<em>{{n(a.count)}}</em></span>
+              </div>
+            </div>
             <div class="rank-value">{{n(m.count)}} req</div>
           </div>
         </div>

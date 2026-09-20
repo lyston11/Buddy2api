@@ -83,6 +83,35 @@ def resolve(channel: str, model: str) -> str:
     return merged_map(channel).get(value, value)
 
 
+def canonical_model_name(channel: str, model: str) -> str:
+    """统计口径的模型归一：把 `@后缀` 账号别名折算回目标物理模型。
+
+    `@后缀` 别名（如 deepseek-v4.1-flash@team-buka）是为账号隔离手工注册的，
+    全部映射到同一物理模型；统计若按原始名分组，一个模型会被拆成多行，
+    裸名行也看不出流量落点。已注册的按别名表解析，未注册但带 `@` 的按
+    运维约定剥离后缀兜底。
+
+    刻意不折叠普通别名（如 gpt-4o → glm-5.2）：那是兼容入口名，运营上
+    仍需要单独看它的流量；只有 `@` 名参与归一。
+    """
+    value = (model or "").strip()
+    if not value or "@" not in value:
+        return value
+    mapping = merged_map(channel or "workbuddy")
+    resolved = value
+    # 别名可能链式指向另一个别名，有限次迭代防配置成环
+    for _ in range(5):
+        target = mapping.get(resolved)
+        if not target or target == resolved:
+            break
+        resolved = target
+        if "@" not in resolved:
+            break
+    if "@" not in resolved:
+        return resolved
+    return resolved.split("@", 1)[0] or value
+
+
 def builtin_keys(channel: str) -> set[str]:
     return set(_builtin_aliases(channel))
 
