@@ -115,3 +115,55 @@ def test_rows_without_account_attribution_flagged():
     assert row["accounts"][0]["name"] == "未知账号"
     assert row["accounts"][0]["count"] == 1
     assert row["accounts"][0]["last_used_at"] > 0
+
+
+def test_account_breakdown_covers_all_names_of_a_top_model():
+    """Top 模型的账号分布必须覆盖它的全部原始名，包括未进候选的 @别名。
+
+    账号分布查询按 Top 模型的原始名收窄（不能全表分组），所以这里钉死
+    「归一后属于 Top 模型的名字都被带上了」——否则下钻会少账号。
+    """
+    _register_aliases({"deepseek-v4.1-flash@team-buka": "deepseek-v4.1-flash"})
+    _add("deepseek-v4.1-flash", 1, "buka")
+    _add("deepseek-v4.1-flash@team-buka", 5, "m8ksd0g7g9xu")
+    _add("deepseek-v4.1-flash@xiaoyao", 2, "xiaoyaoaiqima")  # 未注册，剥离后缀兜底
+
+    row = next(r for r in db.get_stats()["model_stats"] if r["model"] == "deepseek-v4.1-flash")
+    names = {a["name"] for a in row["accounts"]}
+    assert names == {"buka", "m8ksd0g7g9xu", "xiaoyaoaiqima"}
+    assert row["count"] == 3
+
+
+def test_candidate_limit_does_not_materialize_every_account_group(monkeypatch):
+    """SQL 层必须收窄候选集：不能把「模型 × 账号」的全量分组搬回 Python。
+
+    回归（2026-09-21）：模型占比改归一后，两条统计 SQL 都去掉了 LIMIT，
+    20 万行 / 3.2 万组的库上 get_stats() 要 ~750ms。这里用记录 SQL 的方式
+    钉死两条查询都带 LIMIT / IN 收窄，不依赖数据量。
+    """
+    _register_aliases({})
+    _add("glm-5.2", 1, "buka")
+
+    executed: list[str] = []
+    real_get_conn = db.get_conn
+
+    class RecordingConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            executed.append(" ".join(sql.split()))
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(db, "get_conn", lambda: RecordingConn(real_get_conn()))
+    db.get_stats()
+
+    log_queries = [q for q in executed if "FROM logs" in q and "GROUP BY model" in q]
+    assert len(log_queries) == 2, f"应只有两条模型统计查询，实际: {log_queries}"
+    candidates = next(q for q in log_queries if "ORDER BY count DESC LIMIT" in q)
+    breakdown = next(q for q in log_queries if q not in {candidates})
+    assert "LIMIT" in candidates, "候选查询必须带 LIMIT，不能全量分组"
+    assert "WHERE model IN (" in breakdown, "账号分布必须按 Top 模型收窄"

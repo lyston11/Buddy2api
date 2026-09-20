@@ -1297,44 +1297,30 @@ def get_stats() -> dict:
 
     # 模型使用统计。logs.model 存的是请求时的原始名，其中 `@后缀` 是账号隔离
     # 用的手工别名（都映射到同一物理模型），直接 GROUP BY 会把一个模型拆成
-    # 多行，裸名行也看不出流量落在哪些账号。这里取全量原始行，用别名表
-    # 归一合并后再取 Top10，并附带 model × account 分布供前端下钻。
+    # 多行，裸名行也看不出流量落在哪些账号。
+    #
+    # 归一必须走 aliases.canonical_model_name（别名表是配置，SQL 里无法 JOIN，
+    # 也不把剥离规则写第二遍以免两处漂移），所以先在 SQL 里把候选集收窄：
+    # logs 是 90 天保留的请求日志表，分组数是「模型数 × 账号数」量级，全量拉回
+    # Python 会随库龄变慢（实测 20 万行 / 3.2 万组时 ~750ms）。
+    #
+    # 候选按原始名取前 MODEL_CANDIDATE_LIMIT 个，对实际部署（目录里几十个
+    # 模型名）留有充分余量：只有单个物理模型被拆成数百个未注册原始名时，
+    # 它的合计才可能被截断。
+    MODEL_CANDIDATE_LIMIT = 500
+
+    # 惰性导入：aliases 在模块层 import database，这里运行期再导入避免环
+    from buddy2api.aliases import canonical_model_name
+
     model_rows = conn.execute("""
         SELECT model, provider, COUNT(*) as count, COALESCE(SUM(total_tokens),0) as tokens,
                COALESCE(SUM(credit),0) as credit,
                COALESCE(AVG(duration_ms),0) as avg_duration_ms
         FROM logs GROUP BY model, provider
-    """).fetchall()
-    model_account_rows = conn.execute("""
-        SELECT model, provider, account_id, COALESCE(account_name,'') as account_name,
-               COUNT(*) as count, MAX(created_at) as last_used_at
-        FROM logs GROUP BY model, provider, account_id, account_name
-    """).fetchall()
-
-    # 惰性导入：aliases 在模块层 import database，这里运行期再导入避免环
-    from buddy2api.aliases import canonical_model_name
+        ORDER BY count DESC LIMIT ?
+    """, (MODEL_CANDIDATE_LIMIT,)).fetchall()
 
     merged: dict[str, dict] = {}
-    accounts_by_model: dict[str, dict] = {}
-    for row in model_account_rows:
-        base = canonical_model_name(row["provider"] or "workbuddy", row["model"])
-        bucket = accounts_by_model.setdefault(base, {})
-        if row["account_id"]:
-            key = ("id", row["account_id"])
-        else:
-            key = ("name", row["account_name"] or "")
-        entry = bucket.get(key)
-        if entry is None:
-            display = row["account_name"] or (f"#{row['account_id']}" if row["account_id"] else "未知账号")
-            entry = {"id": row["account_id"], "name": display, "count": 0, "last_used_at": 0}
-            bucket[key] = entry
-        entry["count"] += int(row["count"] or 0)
-        last_seen = int(row["last_used_at"] or 0)
-        # 同一账号改名后日志里会并存两个名字，以最近一次用的为准
-        if last_seen >= entry["last_used_at"] and row["account_name"]:
-            entry["name"] = row["account_name"]
-        entry["last_used_at"] = max(entry["last_used_at"], last_seen)
-
     for row in model_rows:
         base = canonical_model_name(row["provider"] or "workbuddy", row["model"])
         entry = merged.get(base)
@@ -1348,8 +1334,42 @@ def get_stats() -> dict:
         # 平均耗时按请求数加权合并，各组的 AVG 不能直接相加
         entry["weighted_duration"] += float(row["avg_duration_ms"] or 0) * count
 
+    top = sorted(merged.items(), key=lambda kv: kv[1]["count"], reverse=True)[:10]
+    top_bases = {base for base, _ in top}
+
+    # 账号分布只查 Top 模型的原始名（IN 的取值来自上面的候选集，不随库龄增长）。
+    accounts_by_model: dict[str, dict] = {}
+    top_raw_names = [row["model"] for row in model_rows
+                     if canonical_model_name(row["provider"] or "workbuddy", row["model"]) in top_bases]
+    if top_raw_names:
+        placeholders = ",".join("?" for _ in top_raw_names)
+        model_account_rows = conn.execute(f"""
+            SELECT model, provider, account_id, COALESCE(account_name,'') as account_name,
+                   COUNT(*) as count, MAX(created_at) as last_used_at
+            FROM logs WHERE model IN ({placeholders})
+            GROUP BY model, provider, account_id, account_name
+        """, top_raw_names).fetchall()
+        for row in model_account_rows:
+            base = canonical_model_name(row["provider"] or "workbuddy", row["model"])
+            bucket = accounts_by_model.setdefault(base, {})
+            if row["account_id"]:
+                key = ("id", row["account_id"])
+            else:
+                key = ("name", row["account_name"] or "")
+            entry = bucket.get(key)
+            if entry is None:
+                display = row["account_name"] or (f"#{row['account_id']}" if row["account_id"] else "未知账号")
+                entry = {"id": row["account_id"], "name": display, "count": 0, "last_used_at": 0}
+                bucket[key] = entry
+            entry["count"] += int(row["count"] or 0)
+            last_seen = int(row["last_used_at"] or 0)
+            # 同一账号改名后日志里会并存两个名字，以最近一次用的为准
+            if last_seen >= entry["last_used_at"] and row["account_name"]:
+                entry["name"] = row["account_name"]
+            entry["last_used_at"] = max(entry["last_used_at"], last_seen)
+
     model_stats = []
-    for base, entry in sorted(merged.items(), key=lambda kv: kv[1]["count"], reverse=True)[:10]:
+    for base, entry in top:
         count = entry["count"] or 1
         accounts = sorted(
             accounts_by_model.get(base, {}).values(),
