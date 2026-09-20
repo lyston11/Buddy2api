@@ -13,6 +13,7 @@ import asyncio
 import contextvars
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -504,6 +505,37 @@ def find_auth_files(auth_dir: Optional[str] = None) -> list[Path]:
     return _dedupe_paths(files)
 
 
+# 桌面端每次重新登录会把旧凭据留成时间戳快照，例如：
+# workbuddy-desktop.2026-09-12T16-22-52-595Z.43534.c1e1c986-….info
+# 这些是备份不是新账号，且旧 token 覆盖现有账号会造成降级 —— 必须识别出来。
+_BACKUP_SUFFIX_RE = re.compile(
+    r"\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:-\d+)?Z?"  # .2026-09-12T16-22-52-595Z
+    r"\.\d+"                                            # .43534 (pid)
+    r"\.[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}"  # .uuid
+    r"\.info$",
+    re.IGNORECASE,
+)
+
+
+def is_backup_auth_file(name: str) -> bool:
+    """判断文件名是否为桌面端自动留下的时间戳备份快照。"""
+    return bool(_BACKUP_SUFFIX_RE.search(name or ""))
+
+
+def is_encrypted_field_wrapper(value) -> bool:
+    """判断字段值是否为桌面端的 `$wbEncrypted` 加密信封。
+
+    新版客户端把 accessToken/refreshToken 等写成
+    {"$wbEncrypted": 1, "envelope": "<base64 JSON>"}，密钥只存在客户端侧，
+    网关解不开 —— 见到即按「不可导入」处理（见 seamless_login 模块）。
+    """
+    if not isinstance(value, dict):
+        return False
+    if value.get("$wbEncrypted") != 1:
+        return False
+    return isinstance(value.get("envelope"), str)
+
+
 def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
     meta = {
         "name": path.name,
@@ -514,10 +546,16 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
         "valid": False,
         "reason": "",
         "account_name": "",
+        "uid": "",
         "uid_masked": "",
         "domain": "",
         "expires_at": 0,
         "already_imported": False,
+        "is_backup": is_backup_auth_file(path.name),
+        # 新版桌面端把 token 写成 $wbEncrypted 信封：文件本身是合法的官方
+        # 文件，但网关解不开、导不进来 —— 必须单独标出来，否则面板会显示
+        # 「可导入/已导入」误导用户以为凭据在被使用。
+        "encrypted": False,
     }
     try:
         st = path.stat()
@@ -548,12 +586,77 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
         "valid": True,
         "reason": "ok",
         "account_name": account.get("nickname", "") or path.stem,
+        "uid": uid,
         "uid_masked": _mask_value(uid),
         "domain": auth.get("domain", DEFAULT_DOMAIN),
         "expires_at": auth.get("expiresAt", 0),
         "already_imported": bool(uid and uid in existing_uids),
     })
+    if is_encrypted_field_wrapper(auth.get("accessToken")):
+        meta["encrypted"] = True
+        meta["reason"] = "凭据是新版客户端加密信封，网关无法导入（可用无感登录获取明文凭据）"
     return meta
+
+
+def _account_credential_sources(files: list[dict], accounts: list[dict]) -> list[dict]:
+    """把「本机文件」与「账号」对起来，返回按账号聚合的凭据来源视图。
+
+    面板此前直接列文件，用户会把文件当账号数（16 个文件看起来像 16 个账号），
+    也看不出某个账号到底有没有本机凭据。这里按账号聚合：每行一个账号，标注
+    活跃凭据文件、备份数量，以及「仅数据库（靠刷新续期）」这类无文件账号。
+    另外把本机有文件、库里却没有的 uid 单列成待导入行，避免漏掉可导入账号。
+    """
+    buckets: dict[str, dict] = {}
+    for meta in files:
+        bucket = buckets.setdefault(meta.get("uid") or "", {"live": [], "backups": []})
+        (bucket["backups"] if meta.get("is_backup") else bucket["live"]).append(meta)
+
+    known_uids = {str(a.get("uid") or "") for a in accounts if a.get("uid")}
+    rows: list[dict] = []
+    for account in accounts:
+        uid = str(account.get("uid") or "")
+        bucket = buckets.get(uid, {"live": [], "backups": []})
+        live = bucket["live"]
+        usable = [m for m in live if not m.get("encrypted")]
+        if usable:
+            source = "file"
+        elif live:
+            source = "encrypted"   # 有文件但解不开，实际仍靠数据库里的凭据
+        else:
+            source = "db"
+        rows.append({
+            "id": account.get("id"),
+            "name": account.get("nickname") or account.get("name") or "",
+            "provider": account.get("provider") or "workbuddy",
+            "status": account.get("status") or "",
+            "uid_masked": _mask_value(uid) if uid else "",
+            "source": source,
+            "live_files": [m["name"] for m in live],
+            "importable_files": [m["name"] for m in usable if not m.get("already_imported")],
+            "backup_count": len(bucket["backups"]),
+            "last_mtime": max((m.get("mtime") or 0 for m in live), default=0),
+        })
+
+    for uid, bucket in buckets.items():
+        if not uid or uid in known_uids:
+            continue
+        live = bucket["live"]
+        if not live:
+            continue
+        rows.append({
+            "id": None,
+            "name": live[0].get("account_name") or "未导入账号",
+            "provider": "workbuddy",
+            "status": "",
+            "uid_masked": live[0].get("uid_masked") or "",
+            "source": "unimported" if any(not m.get("encrypted") for m in live) else "encrypted",
+            "live_files": [m["name"] for m in live],
+            "importable_files": [m["name"] for m in live if not m.get("encrypted")],
+            "backup_count": len(bucket["backups"]),
+            "last_mtime": max((m.get("mtime") or 0 for m in live), default=0),
+        })
+    rows.sort(key=lambda r: (r["id"] is None, -(r["last_mtime"] or 0)))
+    return rows
 
 
 def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
@@ -588,15 +691,20 @@ def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
         }
         dirs.append(entry)
 
-    existing_uids = {a.get("uid", "") for a in db.list_accounts() if a.get("uid")}
+    accounts = db.list_accounts()
+    existing_uids = {a.get("uid", "") for a in accounts if a.get("uid")}
     files = [_safe_auth_file_meta(f, existing_uids) for f in find_auth_files(auth_dir)]
     return {
         "dirs": dirs,
         "files": files,
+        "accounts": _account_credential_sources(files, accounts),
         "file_count": len(files),
+        "backup_count": sum(1 for f in files if f.get("is_backup")),
         "valid_count": sum(1 for f in files if f.get("valid")),
         "importable_count": sum(
-            1 for f in files if f.get("valid") and not f.get("already_imported")
+            1 for f in files
+            if f.get("valid") and not f.get("already_imported")
+            and not f.get("is_backup") and not f.get("encrypted")
         ),
         "runtime": {
             "container": in_container,
@@ -672,6 +780,11 @@ def auto_scan_and_import(auth_dir: Optional[str] = None) -> dict:
         if account.get("uid")
     }
     for f in find_auth_files(auth_dir):
+        if is_backup_auth_file(f.name):
+            # 备份快照不是新账号：按 uid 会匹配到现有账号，导入等于用旧
+            # token 覆盖较新凭据（降级），一律跳过。
+            result["skipped"] += 1
+            continue
         parsed = parse_auth_file(f)
         if not parsed:
             result["skipped"] += 1

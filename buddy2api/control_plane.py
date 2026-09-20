@@ -192,6 +192,11 @@ def import_workbuddy(paths: list[str], preview: dict, auth_dir: str | None) -> d
             result["errors"].append({"path": raw, "error": "path is outside WorkBuddy auth dirs"})
             result["skipped"] += 1
             continue
+        if auth_manager.is_backup_auth_file(path.name):
+            # 时间戳备份快照不是新账号：按 uid 会匹配到现有账号，导入等于用
+            # 旧 token 覆盖较新凭据（降级）。启动自动导入同样走这里，必须拦。
+            result["skipped"] += 1
+            continue
         parsed = auth_manager.parse_auth_file(path)
         if not parsed:
             result["skipped"] += 1

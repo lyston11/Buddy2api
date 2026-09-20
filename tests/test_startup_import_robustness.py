@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import buddy2api.auth_manager as auth_manager
+import buddy2api.control_plane as control_plane
 import buddy2api.database as db
 
 
@@ -60,3 +61,135 @@ def test_update_account_with_dict_credential_does_not_crash():
     # 落库内容被序列化成 JSON 字符串：服务活着，且不会把 dict 塞进 TEXT 列
     assert isinstance(account["access_token"], str)
     assert "$wbEncrypted" in account["access_token"]
+
+
+# ------------------------------------------------------------
+# 时间戳备份快照（2026-09-20：auth 目录里 16 个文件中 13 个是备份，
+# 扫描面板看起来"账号爆炸"；更糟的是按 uid 导入会用旧 token 降级覆盖）
+# ------------------------------------------------------------
+
+def _write_snapshot(path: Path, uid: str, access_token: str):
+    path.write_text(json.dumps({
+        "account": {"uid": uid, "nickname": "snap"},
+        "auth": {"accessToken": access_token, "refreshToken": "rt",
+                 "expiresAt": 1, "sessionState": "ss"},
+    }), encoding="utf-8")
+
+
+def test_is_backup_auth_file_matches_real_snapshots():
+    """真实快照文件名必须命中，活跃文件不得误伤。"""
+    assert auth_manager.is_backup_auth_file(
+        "workbuddy-desktop.2026-09-12T16-22-52-595Z.43534.c1e1c986-62ab-4d8e-9ab4-9f8d4bde6a01.info")
+    assert auth_manager.is_backup_auth_file(
+        "workbuddy-desktop-ai.2026-09-14T10-31-16-054Z.33125.577d210d-6547-44e8-bc03-0625843a2d02.info")
+    assert auth_manager.is_backup_auth_file(
+        "workbuddy-desktop.2026-08-20T08-10-43-049Z.50371.f7db3101-f0ce-4696-862e-aef6e29316d2.info")
+    assert not auth_manager.is_backup_auth_file("workbuddy-desktop.info")
+    assert not auth_manager.is_backup_auth_file("workbuddy-desktop-ai.info")
+    assert not auth_manager.is_backup_auth_file("Tencent-Cloud.coding-copilot.info")
+    assert not auth_manager.is_backup_auth_file("")
+
+
+def test_discover_meta_flags_backup(tmp_path):
+    p = tmp_path / "workbuddy-desktop.2026-09-12T16-22-52-595Z.43534.c1e1c986-62ab-4d8e-9ab4-9f8d4bde6a01.info"
+    _write_snapshot(p, "uid-x", "tok")
+    meta = auth_manager._safe_auth_file_meta(p, {"uid-x"})
+    assert meta["is_backup"] is True
+    assert meta["already_imported"] is True
+
+
+def test_auto_scan_skips_backup_snapshots(tmp_path):
+    """手动扫描（POST /admin/accounts/scan）不得用备份旧 token 覆盖现有账号。"""
+    aid = db.add_account({"name": "buka", "uid": "uid-x", "access_token": "current-token"})
+    backup = tmp_path / "workbuddy-desktop.2026-09-12T16-22-52-595Z.43534.c1e1c986-62ab-4d8e-9ab4-9f8d4bde6a01.info"
+    _write_snapshot(backup, "uid-x", "stale-backup-token")
+    live = tmp_path / "workbuddy-desktop-ai.info"
+    _write_snapshot(live, "uid-y", "fresh-live-token")
+
+    result = auth_manager.auto_scan_and_import(str(tmp_path))
+
+    assert result["skipped"] == 1, "备份快照应计为跳过"
+    assert db.get_account(aid)["access_token"] == "current-token", "备份旧 token 不得覆盖现有账号"
+    imported = [a for a in db.list_accounts() if a.get("uid") == "uid-y"]
+    assert len(imported) == 1 and imported[0]["access_token"] == "fresh-live-token"
+
+
+def test_startup_import_skips_backup_snapshots(tmp_path):
+    """启动自动导入（import_workbuddy）同样必须拦截备份快照。"""
+    aid = db.add_account({"name": "buka", "uid": "uid-x", "access_token": "current-token"})
+    backup = tmp_path / "workbuddy-desktop.2026-09-12T16-22-52-595Z.43534.c1e1c986-62ab-4d8e-9ab4-9f8d4bde6a01.info"
+    _write_snapshot(backup, "uid-x", "stale-backup-token")
+
+    files = [{"path": str(backup)}]
+    token = control_plane.issue_preview("workbuddy", files)
+    result = control_plane.import_workbuddy([str(backup)], control_plane.lookup_preview(token, "workbuddy"), str(tmp_path))
+
+    assert result["skipped"] == 1 and result["imported"] == 0 and result["updated"] == 0
+    assert db.get_account(aid)["access_token"] == "current-token"
+
+
+# ------------------------------------------------------------
+# 加密信封识别 + 按账号聚合的凭据来源视图（2026-09-20：
+# 「本机登录检测」把文件列表当成了账号列表，16 个文件看起来像 16 个账号）
+# ------------------------------------------------------------
+
+def _write_envelope(path: Path, uid: str):
+    """写一份新版客户端格式：token 为 $wbEncrypted 信封，uid 仍明文。"""
+    path.write_text(json.dumps({
+        "account": {"uid": uid, "nickname": {"$wbEncrypted": 1, "envelope": "x"}},
+        "auth": {"accessToken": {"$wbEncrypted": 1, "envelope": "abc"},
+                 "refreshToken": {"$wbEncrypted": 1, "envelope": "def"},
+                 "expiresAt": 1, "sessionState": "ss"},
+    }), encoding="utf-8")
+
+
+def test_is_encrypted_field_wrapper():
+    assert auth_manager.is_encrypted_field_wrapper({"$wbEncrypted": 1, "envelope": "abc"})
+    assert not auth_manager.is_encrypted_field_wrapper("plain-token")
+    assert not auth_manager.is_encrypted_field_wrapper({"$wbEncrypted": 1})
+    assert not auth_manager.is_encrypted_field_wrapper(None)
+    assert not auth_manager.is_encrypted_field_wrapper({"other": 1, "envelope": "abc"})
+
+
+def test_meta_flags_envelope_as_not_importable(tmp_path):
+    p = tmp_path / "workbuddy-desktop.info"
+    _write_envelope(p, "uid-env")
+
+    meta = auth_manager._safe_auth_file_meta(p, set())
+
+    assert meta["encrypted"] is True
+    assert "无感登录" in meta["reason"], "面板要能说清「为什么不能导入」"
+    assert meta["uid"] == "uid-env", "信封文件的 uid 仍是明文，聚合要靠它"
+
+
+def test_discover_accounts_view_maps_accounts_to_sources(tmp_path):
+    """每行一个账号：本机文件 / 仅数据库 / 信封，备份数挂到账号下。"""
+    db.add_account({"name": "with-file", "uid": "uid-a", "access_token": "tok-a"})
+    db.add_account({"name": "db-only", "uid": "uid-b", "access_token": "tok-b"})
+    db.add_account({"name": "enveloped", "uid": "uid-c", "access_token": "tok-c"})
+    _write_snapshot(tmp_path / "workbuddy-desktop-ai.info", "uid-a", "tok-a")
+    _write_snapshot(tmp_path / "workbuddy-desktop.2026-09-12T16-22-52-595Z.43534.c1e1c986-62ab-4d8e-9ab4-9f8d4bde6a01.info", "uid-a", "old")
+    _write_envelope(tmp_path / "workbuddy-desktop.info", "uid-c")
+
+    disc = auth_manager.discover_auth_files(str(tmp_path))
+    rows = {r["name"]: r for r in disc["accounts"]}
+
+    assert rows["with-file"]["source"] == "file"
+    assert rows["with-file"]["live_files"] == ["workbuddy-desktop-ai.info"]
+    assert rows["with-file"]["backup_count"] == 1
+    assert rows["db-only"]["source"] == "db" and rows["db-only"]["live_files"] == []
+    assert rows["enveloped"]["source"] == "encrypted"
+    assert rows["enveloped"]["live_files"] == ["workbuddy-desktop.info"]
+    assert disc["importable_count"] == 0, "信封文件不可导入"
+
+
+def test_discover_accounts_view_lists_unimported_uid(tmp_path):
+    """本机有文件、库里没账号的 uid 必须单列，否则看不到「可导入」。"""
+    _write_snapshot(tmp_path / "workbuddy-desktop-ai.info", "uid-new", "fresh")
+
+    disc = auth_manager.discover_auth_files(str(tmp_path))
+    new_rows = [r for r in disc["accounts"] if r["source"] == "unimported"]
+
+    assert len(new_rows) == 1 and new_rows[0]["id"] is None
+    assert new_rows[0]["importable_files"] == ["workbuddy-desktop-ai.info"]
+    assert disc["importable_count"] == 1
