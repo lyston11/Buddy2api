@@ -616,8 +616,20 @@ def parse_auth_file(path: Path) -> Optional[dict]:
 
     account = data.get("account", {})
     auth = data.get("auth", {})
-    if not auth.get("accessToken"):
+    access = auth.get("accessToken")
+    if not isinstance(access, str) or not access:
+        # 2026-09-20：桌面端新版 auth 文件把 accessToken/refreshToken 写成了
+        # {"$wbEncrypted": .., "envelope": ..} 加密信封，网关解不开。这里必须
+        # 按无凭据跳过 —— 若把信封 dict 透传，_protect_account_data 加密时
+        # 直接 AttributeError，启动自动导入崩溃循环；更糟的是库里可用的存量
+        # 令牌会被信封垃圾覆盖。
         return None
+    refresh = auth.get("refreshToken")
+    if refresh is not None and not isinstance(refresh, str):
+        return None
+    session_state = auth.get("sessionState", "")
+    if not isinstance(session_state, str):
+        session_state = ""
 
     return {
         "name": account.get("nickname", "") or path.stem,
@@ -625,13 +637,13 @@ def parse_auth_file(path: Path) -> Optional[dict]:
         "nickname": account.get("nickname", ""),
         "phone": account.get("phoneNumber", ""),
         "account_type": account.get("type", "personal"),
-        "access_token": auth.get("accessToken", ""),
-        "refresh_token": auth.get("refreshToken", ""),
+        "access_token": access,
+        "refresh_token": refresh if isinstance(refresh, str) else "",
         "expires_at": auth.get("expiresAt", 0),
         "refresh_expires_at": auth.get("refreshExpiresAt", 0),
         "domain": auth.get("domain", DEFAULT_DOMAIN),
         "enterprise_id": account.get("enterpriseId", ""),
-        "session_state": auth.get("sessionState", ""),
+        "session_state": session_state,
     }
 
 
