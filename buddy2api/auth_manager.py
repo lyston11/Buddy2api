@@ -134,6 +134,65 @@ def forget_cost_profile() -> None:
         _cost_profile_cache = (0.0, {})
 
 
+# 即将到期的积分画像：读管理页「刷新官方额度」写下的 account_resource_cache。
+# 选路在每次请求的热路径上，绝不能在这里同步打上游接口 —— 只读本地缓存，
+# 用 TTL 拦住频繁的批量读（实测 6 个账号 0.38ms，与 recent_account_loads 同量级）。
+_expiry_profile_lock = threading.Lock()
+_expiry_profile_cache: tuple[float, dict] = (0.0, {})
+EXPIRY_PROFILE_TTL = 60.0
+
+
+def _expiry_profile() -> dict[int, dict]:
+    """带缓存的「各账号即将到期的积分」画像。
+
+    返回 {账号 id: {"amount": 即将到期积分数, "days": 距离最近一次到期还有几天}}，
+    只包含**确有即将到期积分**的账号 —— 没到期的、额度状态不明的都不进去，
+    避免把请求引到额度未知的账号上。
+    """
+    global _expiry_profile_cache
+    now = time.monotonic()
+    with _expiry_profile_lock:
+        stamp, cached = _expiry_profile_cache
+        if cached and now - stamp < EXPIRY_PROFILE_TTL:
+            return cached
+    try:
+        caches = db.all_account_resource_caches()
+    except Exception:
+        return {}
+    now_ts = time.time()
+    profile: dict[int, dict] = {}
+    for aid, payload in caches.items():
+        # 上次刷新失败（或读到的是残缺的旧快照）就不参与到期加权：
+        # 宁可让路由自己探索，也不要按一个不确定的额度去挑账号。
+        if not payload.get("ok"):
+            continue
+        amount = _to_float(payload.get("expiring_30d_total"))
+        ts = payload.get("next_expire_ts")
+        if amount <= 0 or not ts:
+            continue
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            continue
+        # 缓存太旧、那个包已经过期了：里面的积分数值已经不作数，跳过。
+        if ts <= now_ts:
+            continue
+        profile[int(aid)] = {
+            "amount": amount,
+            "days": (ts - now_ts) / 86400,
+        }
+    with _expiry_profile_lock:
+        _expiry_profile_cache = (now, profile)
+    return profile
+
+
+def forget_expiry_profile() -> None:
+    """清掉到期积分画像缓存（额度刷新后调用，让新数据立刻生效）。"""
+    global _expiry_profile_cache
+    with _expiry_profile_lock:
+        _expiry_profile_cache = (0.0, {})
+
+
 def _get_token_lock(aid: int) -> asyncio.Lock:
     with _token_locks_guard:
         if aid not in _token_locks:
@@ -248,11 +307,15 @@ def _auto_site_preference(model: str) -> str:
         scored.append((group, int(stats.get("paid") or 0), credit / requests))
     if len(scored) < 2:
         return ""
-    # 先比「收过费的次数」（0 = 完全免费），再比平均单次扣费
-    scored.sort(key=lambda item: (item[1], item[2]))
+    # 先看「是否完全免费」，再比平均单次扣费。
+    #
+    # 这里**不能**拿「收过费的次数」当第二比较键：它只反映请求量，不反映价格。
+    # 实测 glm-5.3 两边都是每次都收费（国内 31/31、国际 139/139），但单价差 5.6 倍
+    # （13.31 vs 2.37）—— 按收费次数比会选中贵的那边。
+    scored.sort(key=lambda item: (0 if item[1] == 0 else 1, item[2]))
     best, worst = scored[0], scored[-1]
     # 两边计费表现一样时不必偏向任何一边，保持不区分（负载才能摊平）
-    if (best[1], best[2]) == (worst[1], worst[2]):
+    if (0 if best[1] == 0 else 1, best[2]) == (0 if worst[1] == 0 else 1, worst[2]):
         return ""
     return best[0]
 
@@ -1293,6 +1356,8 @@ async def fetch_account_resources(
     }
     if ok and account.get("id"):
         db.upsert_account_resource_cache(account["id"], result)
+        # 刚拿到新额度数据，让选路的到期积分画像立刻生效，不用等 TTL 过期。
+        forget_expiry_profile()
     if not ok:
         return _resource_failure(
             account,
@@ -1578,6 +1643,41 @@ def _route_sort_key(account: dict, loads: Optional[dict[int, int]] = None):
     )
 
 
+# 「即将到期的积分」在同档候选里的比较容差（天）。
+# 不设容差会退化成「永远只用到期最早的那个账号」—— 它的负载再高也一直优先，
+# 而到期晚一点的账号永远用不上。容差内视作同样紧急，再按负载摊开。
+EXPIRY_URGENCY_SLACK_DAYS = 1.0
+
+
+def _most_urgent_expiring(accounts: list[dict]) -> list[dict]:
+    """从同档候选里挑出「积分最快要到期」的那一批（可能为空）。
+
+    为什么需要它：账号的积分是**限时包**（实测某个国内账号 1500 分 29 天后到期、
+    另一个 1285 分 24 天后到期），过期作废。所以「该花哪个账号的积分」不只是
+    「哪边便宜」，还包括「哪边的积分快没了」：快到期的先用掉，否则就等于浪费。
+
+    只在确有即将到期积分的账号上收窄范围：没有额度数据（还没在管理页刷新过官方
+    额度）、或没有 30 天内到期的包时，行为与以前完全一致，仍然纯按负载均衡。
+    """
+    profile = _expiry_profile()
+    if not profile:
+        return []
+    dated = [
+        (a, profile[int(a["id"])])
+        for a in accounts
+        if int(a.get("id") or 0) in profile
+    ]
+    if not dated:
+        return []
+    soonest = min(info["days"] for _, info in dated)
+    urgent = [a for a, info in dated if info["days"] <= soonest + EXPIRY_URGENCY_SLACK_DAYS]
+    # 只有「急着用」的账号占少数时才收窄；若全员都差不多急，收窄没有意义，
+    # 反而把负载均衡挤掉了。
+    if len(urgent) >= len(accounts):
+        return []
+    return urgent
+
+
 # 粘性按 (通道, 模型) 分槽。不同模型能服务的账号集本来就不同（国内模型只有国内账号
 # 有），共用一个槽会互相顶掉 —— 那正是「混装账号之后所有请求都压在一个账号上」的来源。
 _STICKY_WILDCARD = "*"
@@ -1710,6 +1810,19 @@ def pick_account(
     highest_priority = max(_route_priority(a) for a in candidates)
     top_candidates = [a for a in candidates if _route_priority(a) == highest_priority]
     loads = db.recent_account_loads()
+
+    # 积分快到期就先消耗它：只在候选里确实有「即将到期」的账号时生效。
+    # 不排除任何账号（都没快到期的账号时照旧走负载均衡），只把比较范围收窄到
+    # 同档最急的那批，里面再用原本的「窗口内请求数 / 权重」排序决定用哪个。
+    #
+    # 位置刻意放在站点偏好**之后**：同一个模型两边计费不同（deepseek-v4.1-flash
+    # 国际站免费、国内站扣费），先用便宜的那边、再在那边的账号里挑积分快到期的，
+    # 才能同时做到「不花冤枉钱」与「不浪费快作废的积分」。反过来会把请求赶到
+    # 收费站点上去花真积分，只为了消耗本来就快作废的积分 —— 净亏。
+    expiring = _most_urgent_expiring(top_candidates)
+    if expiring:
+        top_candidates = expiring
+
     chosen = sorted(top_candidates, key=lambda a: _route_sort_key(a, loads))[0]
     key = _sticky_key(provider, model)
     with _route_lock:

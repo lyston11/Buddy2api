@@ -44,6 +44,7 @@ def _clear_route_state():
         auth_manager._account_models.clear()
         auth_manager._account_denied.clear()
         auth_manager.forget_cost_profile()
+        auth_manager.forget_expiry_profile()
 
     _reset()
     yield
@@ -837,3 +838,174 @@ def test_rate_limit_state_is_swept_when_account_is_deleted():
     auth_manager.forget_account(a)
 
     assert (a, "m") not in auth_manager._model_rate_limits
+
+
+# ============================================================
+# 积分快到期就先消耗
+#
+# 账号的积分是限时包，过期作废（实测：某个国内账号 1500 分 29 天后到期、
+# 另一个 1285 分 24 天后到期）。所以「该花哪个账号的积分」不只是「哪边便宜」，
+# 还包括「哪边的积分快没了」：快到期的先用掉，否则等于浪费。
+# ============================================================
+
+def _seed_expiring(aid: int, amount: float, days: float, *, ok: bool = True) -> None:
+    """写入一份额度缓存，模拟管理页「刷新官方额度」的结果。"""
+    db.upsert_account_resource_cache(aid, {
+        "ok": ok,
+        "expiring_30d_total": amount,
+        "next_expire_ts": int(time.time() + days * 86400),
+        "next_expire_amount": amount,
+        "next_expire_days": days,
+        "available_total": amount,
+    })
+    auth_manager.forget_expiry_profile()
+
+
+def test_soonest_expiring_account_goes_first():
+    """核心诉求：快过期的积分先用，哪怕另一个账号更空闲。
+
+    没这条规则时，负载均衡会一直选最空闲的那个，快到期的积分就静静烂掉。
+    """
+    soon = _make_account("soon", "www.workbuddy.cn")
+    later = _make_account("later", "www.workbuddy.cn")
+    auth_manager.record_account_models(soon, ["m"])
+    auth_manager.record_account_models(later, ["m"])
+    # later 更空闲，soon 已经干了很多活
+    _serve(later, 0)
+    _serve(soon, 50)
+
+    _seed_expiring(soon, amount=1500, days=8)
+    _seed_expiring(later, amount=100, days=29)
+
+    assert auth_manager.pick_account(model="m")["id"] == soon
+
+
+def test_expiring_preference_ignores_accounts_without_cached_quota():
+    """没有额度数据的账号不参与到期比较，但也不会因此被排除。
+
+    没在管理页刷新过官方额度时，行为必须与以前完全一致（纯负载均衡）。
+    """
+    tracked = _make_account("tracked", "www.workbuddy.cn")
+    untracked = _make_account("untracked", "www.workbuddy.cn")
+    auth_manager.record_account_models(tracked, ["m"])
+    auth_manager.record_account_models(untracked, ["m"])
+
+    _seed_expiring(tracked, amount=1000, days=3)
+    # untracked 完全没有缓存记录；它仍然在候选里，只是不参与「谁更急」的比较
+    picks = {auth_manager.pick_account(model="m")["id"] for _ in range(5)}
+    assert picks == {tracked}, "只有 tracked 有即将到期的积分，应先消耗它"
+    assert auth_manager.pick_account(exclude_ids={tracked}, model="m")["id"] == untracked
+
+
+def test_expiry_urgency_has_slack_to_avoid_starvation():
+    """到期时间相近时按负载摊开，不能永远只压到期最早的那一个。
+
+    没有容差的话，到期早一天的账号会因为「永远最急」而吃掉全部流量，
+    到期稍晚的账号永远轮不到 —— 那只是把「只用一个账号」换了个理由。
+    """
+    a = _make_account("a", "www.workbuddy.cn")
+    b = _make_account("b", "www.workbuddy.cn")
+    auth_manager.record_account_models(a, ["m"])
+    auth_manager.record_account_models(b, ["m"])
+    _seed_expiring(a, amount=1000, days=10.0)
+    _seed_expiring(b, amount=1000, days=10.5)   # 0.5 天差距 < 1 天容差
+
+    picks = []
+    for _ in range(10):
+        chosen = auth_manager.pick_account(model="m")["id"]
+        picks.append(chosen)
+        _serve(chosen)
+    assert set(picks) == {a, b}, f"容差内应按负载摊开，实际 {picks}"
+
+
+def test_expiry_beats_load_but_not_priority():
+    """到期加权只在同优先级、同档候选内生效，不能推翻优先级。"""
+    high = _make_account("high", "www.workbuddy.cn")
+    low = _make_account("low", "www.workbuddy.cn")
+    auth_manager.record_account_models(high, ["m"])
+    auth_manager.record_account_models(low, ["m"])
+    db.update_account(high, {"priority": 10})
+    db.update_account(low, {"priority": 0})
+
+    _seed_expiring(low, amount=1000, days=1)    # low 更急，但优先级低
+    _seed_expiring(high, amount=1000, days=20)
+
+    assert auth_manager.pick_account(model="m")["id"] == high
+
+
+def test_expired_or_failed_quota_cache_does_not_steer_routing():
+    """额度刷新失败、或那个包已经过期了，都不能拿来当路由依据。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    b = _make_account("b", "www.workbuddy.cn")
+    auth_manager.record_account_models(a, ["m"])
+    auth_manager.record_account_models(b, ["m"])
+
+    # 刷新失败（ok=False）→ 不参与
+    _seed_expiring(a, amount=9999, days=1, ok=False)
+    # 缓存里的到期时间已经过去 → 那个包的积分数值不作数
+    db.upsert_account_resource_cache(b, {
+        "ok": True, "expiring_30d_total": 9999,
+        "next_expire_ts": int(time.time() - 3600),
+    })
+    auth_manager.forget_expiry_profile()
+
+    picks = []
+    for _ in range(6):
+        chosen = auth_manager.pick_account(model="m")["id"]
+        picks.append(chosen)
+        _serve(chosen)
+    assert set(picks) == {a, b}, "两者都不该被当成「即将到期」，应回到负载均衡"
+
+
+def test_all_accounts_equally_urgent_falls_back_to_load_balancing():
+    """全员都同样紧急时收窄范围没有意义，应保留负载均衡。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    b = _make_account("b", "www.workbuddy.cn")
+    auth_manager.record_account_models(a, ["m"])
+    auth_manager.record_account_models(b, ["m"])
+    _seed_expiring(a, amount=500, days=5)
+    _seed_expiring(b, amount=500, days=5)
+
+    picks = []
+    for _ in range(8):
+        chosen = auth_manager.pick_account(model="m")["id"]
+        picks.append(chosen)
+        _serve(chosen)
+    assert set(picks) == {a, b}, picks
+
+
+def test_expiry_profile_ignores_broken_cache_payload():
+    """额度缓存被写坏时不能让选路崩掉。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    auth_manager.record_account_models(a, ["m"])
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO account_resource_cache (account_id, payload, updated_at)"
+        " VALUES (?,?,?)",
+        (a, "{not json", int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+    auth_manager.forget_expiry_profile()
+
+    assert auth_manager.pick_account(model="m")["id"] == a
+
+
+def test_auto_compares_unit_price_not_request_counts():
+    """两边都收费时按**单价**比，不能拿「收费次数」当比较键。
+
+    回归点（实测 glm-5.3）：两边都是每次都收费（国内 31/31、国际 139/139），
+    但单价差 5.6 倍（13.31 vs 2.37）。旧实现先比收费次数，于是选中了贵的那边 ——
+    收费次数只反映请求量，跟价格无关。
+    """
+    intl = _make_account("intl", "www.workbuddy.ai")
+    cn = _make_account("cn", "www.workbuddy.cn")
+    auth_manager.record_account_models(intl, ["m"])
+    auth_manager.record_account_models(cn, ["m"])
+    # 国内：31 次请求全部收费，累计 412.57（单价 13.31）
+    _serve(cn, 31, model="m", credit=412.57)
+    # 国际：139 次请求全部收费，累计 328.83（单价 2.37）—— 请求更多但更便宜
+    _serve(intl, 139, model="m", credit=328.83)
+    auth_manager.forget_cost_profile()
+
+    assert auth_manager.preferred_site_for("m") == sites.SITE_INTERNATIONAL

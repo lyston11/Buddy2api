@@ -109,9 +109,23 @@ The international and domestic editions are billed separately, and **“free” 
 | `deepseek-v4.1-flash` | free (1750/1750 requests charged 0) | billed (485 of 497 requests charged) |
 | `glm-5.3` | billed | — |
 
-So the default site preference is **`auto`**: it reads the request log, measures what each model actually cost on each site, and prefers the side that is free or cheaper per call. The order is “fewer charged requests” first, then lower average cost per call. Equal billing on both sides means the site is not distinguished (no point giving up load balancing), and fewer than 5 samples also means no distinction until there is enough data.
+So the default site preference is **`auto`**: it reads the request log, measures what each model actually cost on each site, and prefers the side that is free or cheaper per call. The order is “is it completely free” first, then lower **average cost per call**. Equal billing on both sides means the site is not distinguished (no point giving up load balancing), and fewer than 5 samples also means no distinction until there is enough data.
 
 To set it by hand, go to **Models → Site preference** and choose International / Domestic / Auto / No preference per model, or set a single default for models without their own entry.
+
+### How do expiring credits get used first?
+
+Account credits come in **time-limited packages** that are lost on expiry. So within the same tier of candidates the gateway **prefers the account whose credits expire soonest** — that is exactly what the “Expiring soon” column on the accounts page reports (the `30-day expiring` total plus the nearest expiry time).
+
+The order is:
+
+1. **Narrow to the cheaper side first** via site preference (free > lower unit price);
+2. then, among that side's accounts, take the batch expiring **soonest** (within a 1-day slack, so it does not degrade into “always use the single earliest-expiring account”);
+3. finally spread load within that batch using the usual in-window requests per weight.
+
+The order cannot be reversed: picking by expiry first would push requests onto the paid site to burn credits that were about to expire anyway — a net loss.
+
+The expiry data comes from the local cache written by **Refresh official quota** on the accounts page; **routing never calls upstream for it**. Accounts that were never refreshed, or whose refresh failed, simply do not take part in this step (they are not excluded and still compete on load), so behaviour without a refresh is exactly as before.
 
 This is a pure preference: if the preferred side has no usable account, or all of its accounts have been tried, the request falls back to the other side rather than failing.
 
