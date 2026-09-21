@@ -104,6 +104,64 @@ def test_build_backend_body_maps_developer_messages_to_system(monkeypatch):
     assert messages[0]["role"] == "developer"
 
 
+def test_build_backend_body_inserts_system_when_first_message_is_user(monkeypatch):
+    """上游要求首条必须是 system，否则回 11128 first message is not system prompt。"""
+    monkeypatch.delenv("CB_GATEWAY_SYSTEM_PROMPT", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert body["messages"][0] == {
+        "role": "system",
+        "content": "You are a helpful assistant.",
+    }
+    assert body["messages"][1] == {"role": "user", "content": "hello"}
+
+
+def test_build_backend_body_does_not_duplicate_existing_system(monkeypatch):
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "auto",
+        "messages": [
+            {"role": "system", "content": "already here"},
+            {"role": "user", "content": "hello"},
+        ],
+    })
+
+    assert [message["role"] for message in body["messages"]] == ["system", "user"]
+    assert body["messages"][0]["content"] == "already here"
+
+
+@pytest.mark.parametrize("value", ["off", "none", "false", "0"])
+def test_build_backend_body_can_disable_system_injection(monkeypatch, value):
+    monkeypatch.setenv("CB_GATEWAY_SYSTEM_PROMPT", value)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert body["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_build_backend_body_system_prompt_can_be_overridden(monkeypatch):
+    """自定义文案要原样使用，不是只在「有没有」上生效。"""
+    monkeypatch.setenv("CB_GATEWAY_SYSTEM_PROMPT", "  你是家谱助手。  ")
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert body["messages"][0]["content"] == "你是家谱助手。"
+
+
 def test_build_backend_body_fills_missing_reasoning_content_in_thinking_mode(monkeypatch):
     """thinking 模式下 assistant 缺 reasoning_content 会导致上游 11155，需补空串占位。"""
     monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
