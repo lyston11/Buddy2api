@@ -1649,16 +1649,43 @@ def _route_sort_key(account: dict, loads: Optional[dict[int, int]] = None):
 EXPIRY_URGENCY_SLACK_DAYS = 1.0
 
 
-def _most_urgent_expiring(accounts: list[dict]) -> list[dict]:
+def _site_charges_for_model(model: str, group: str) -> bool:
+    """这个模型在这个站点上是否真的扣积分（从实测计费画像判断）。
+
+    到期优先的**前提是这次调用真的消耗积分**（用户的原始要求就是「如果是需要消耗
+    积分的模型调用」）。在免费的模型×站点组合上优先到期账号是纯损失：不消耗任何
+    积分，却白白放弃负载均衡，还会把到期晚的账号彻底饿死。
+
+    实测：deepseek-v4.1-flash 国际站 13254 次请求 0 次收费（免费），国内站 3202 次
+    里 3188 次收费；glm-5.3 国际站则每次都收费。所以必须按「模型 × 站点」判，
+    不能按站点一刀切。
+
+    没有计费样本时返回 False（不启用到期优先），与 `_auto_site_preference` 的
+    「样本不足不下结论」保持同一口径：宁可先不优化，也不要凭猜测打乱选路。
+    """
+    if not model:
+        return False
+    stats = (cost_profile().get(str(model).strip()) or {}).get(group)
+    if not isinstance(stats, dict):
+        return False
+    return int(stats.get("paid") or 0) > 0
+
+
+def _most_urgent_expiring(accounts: list[dict], model: Optional[str] = None) -> list[dict]:
     """从同档候选里挑出「积分最快要到期」的那一批（可能为空）。
 
     为什么需要它：账号的积分是**限时包**（实测某个国内账号 1500 分 29 天后到期、
     另一个 1285 分 24 天后到期），过期作废。所以「该花哪个账号的积分」不只是
     「哪边便宜」，还包括「哪边的积分快没了」：快到期的先用掉，否则就等于浪费。
 
-    只在确有即将到期积分的账号上收窄范围：没有额度数据（还没在管理页刷新过官方
+    但只在「这次调用真的消耗积分」时才收窄（见 `_site_charges_for_model`）：
+    免费组合上不消耗任何积分，优先到期账号毫无收益。
+
+    另外只在确有即将到期积分的账号上收窄：没有额度数据（还没在管理页刷新过官方
     额度）、或没有 30 天内到期的包时，行为与以前完全一致，仍然纯按负载均衡。
     """
+    if not model:
+        return []
     profile = _expiry_profile()
     if not profile:
         return []
@@ -1666,6 +1693,9 @@ def _most_urgent_expiring(accounts: list[dict]) -> list[dict]:
         (a, profile[int(a["id"])])
         for a in accounts
         if int(a.get("id") or 0) in profile
+        # 只让「在这个站点上打这个模型会扣积分」的账号参与：免费站点上的账号
+        # 虽然也有快到期的积分，但服务这个模型时根本不消耗它们。
+        and _site_charges_for_model(model, sites.site_group(a.get("domain")))
     ]
     if not dated:
         return []
@@ -1819,7 +1849,7 @@ def pick_account(
     # 国际站免费、国内站扣费），先用便宜的那边、再在那边的账号里挑积分快到期的，
     # 才能同时做到「不花冤枉钱」与「不浪费快作废的积分」。反过来会把请求赶到
     # 收费站点上去花真积分，只为了消耗本来就快作废的积分 —— 净亏。
-    expiring = _most_urgent_expiring(top_candidates)
+    expiring = _most_urgent_expiring(top_candidates, model)
     if expiring:
         top_candidates = expiring
 

@@ -115,7 +115,7 @@ To set it by hand, go to **Models → Site preference** and choose International
 
 ### How do expiring credits get used first?
 
-Account credits come in **time-limited packages** that are lost on expiry. So within the same tier of candidates the gateway **prefers the account whose credits expire soonest** — that is exactly what the “Expiring soon” column on the accounts page reports (the `30-day expiring` total plus the nearest expiry time).
+Account credits come in **time-limited packages** that are lost on expiry. So **on calls that really do consume credits**, the gateway prefers the account whose credits expire soonest — that is exactly what the “Expiring soon” column on the accounts page reports (the `30-day expiring` total plus the nearest expiry time).
 
 The order is:
 
@@ -123,7 +123,10 @@ The order is:
 2. then, among that side's accounts, take the batch expiring **soonest** (within a 1-day slack, so it does not degrade into “always use the single earliest-expiring account”);
 3. finally spread load within that batch using the usual in-window requests per weight.
 
-The order cannot be reversed: picking by expiry first would push requests onto the paid site to burn credits that were about to expire anyway — a net loss.
+Both preconditions are deliberate:
+
+- **It only applies when that model × site pair actually charges.** On a free pair (measured: `deepseek-v4.1-flash` on the international site, 13254 requests, 0 charged) nothing is consumed, so preferring near-expiry accounts buys nothing while needlessly giving up load balancing and starving later-expiring accounts. The decision uses the measured billing profile; with no billing samples it also stays off rather than guessing.
+- **The order cannot be reversed.** Picking by expiry first would push requests onto the paid site to burn credits that were about to expire anyway — a net loss.
 
 The expiry data comes from the local cache written by **Refresh official quota** on the accounts page; **routing never calls upstream for it**. Accounts that were never refreshed, or whose refresh failed, simply do not take part in this step (they are not excluded and still compete on load), so behaviour without a refresh is exactly as before.
 

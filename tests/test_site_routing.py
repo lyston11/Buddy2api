@@ -861,6 +861,16 @@ def _seed_expiring(aid: int, amount: float, days: float, *, ok: bool = True) -> 
     auth_manager.forget_expiry_profile()
 
 
+def _seed_billing(aid: int, model: str, unit_price: float, n: int = 5) -> None:
+    """让实测计费画像知道「这个账号服务这个模型是扣积分的」。
+
+    到期优先只在**真的消耗积分**时启用（见 _site_charges_for_model），所以测这套
+    逻辑必须先建立计费样本，否则会走「不启用」分支。
+    """
+    _serve(aid, n, model=model, credit=unit_price * n)
+    auth_manager.forget_cost_profile()
+
+
 def test_soonest_expiring_account_goes_first():
     """核心诉求：快过期的积分先用，哪怕另一个账号更空闲。
 
@@ -870,6 +880,8 @@ def test_soonest_expiring_account_goes_first():
     later = _make_account("later", "www.workbuddy.cn")
     auth_manager.record_account_models(soon, ["m"])
     auth_manager.record_account_models(later, ["m"])
+    _seed_billing(soon, "m", unit_price=0.5)
+    _seed_billing(later, "m", unit_price=0.5)
     # later 更空闲，soon 已经干了很多活
     _serve(later, 0)
     _serve(soon, 50)
@@ -878,6 +890,75 @@ def test_soonest_expiring_account_goes_first():
     _seed_expiring(later, amount=100, days=29)
 
     assert auth_manager.pick_account(model="m")["id"] == soon
+
+
+def test_expiring_preference_is_skipped_on_free_model_site():
+    """免费组合上不得启用到期优先（回归）。
+
+    实测事故：deepseek-v4.1-flash 国际站完全免费（13254 次请求 0 次收费），但到期
+    优先把它无条件收窄到两个「8 天到期」的账号上，第三个国际账号被彻底饿死。
+    免费调用不消耗任何积分，为它放弃负载均衡是纯损失。
+    """
+    a = _make_account("a", "www.workbuddy.ai")
+    b = _make_account("b", "www.workbuddy.ai")
+    c = _make_account("c", "www.workbuddy.ai")
+    for aid in (a, b, c):
+        auth_manager.record_account_models(aid, ["free-model"])
+    # 三个账号都免费服务这个模型 → 计费画像里 paid=0
+    for aid in (a, b, c):
+        _serve(aid, 5, model="free-model", credit=0.0)
+    auth_manager.forget_cost_profile()
+
+    _seed_expiring(a, amount=217, days=8)
+    _seed_expiring(b, amount=136, days=8)
+    _seed_expiring(c, amount=280, days=13)
+
+    assert auth_manager._most_urgent_expiring(
+        [db.get_account(a), db.get_account(b), db.get_account(c)], "free-model"
+    ) == [], "免费模型不该按到期收窄"
+
+    # 完整选路：三个账号都应被用到，而不是只压 a/b
+    picks = []
+    for _ in range(12):
+        chosen = auth_manager.pick_account(model="free-model")["id"]
+        picks.append(chosen)
+        _serve(chosen, 1, model="free-model", credit=0.0)
+    assert set(picks) == {a, b, c}, f"免费模型应均衡轮转，实际 {picks}"
+
+
+def test_expiring_preference_still_applies_when_model_is_billed():
+    """对照：同一批账号、同样到期数据，模型改为收费后到期优先必须生效。"""
+    a = _make_account("a", "www.workbuddy.ai")
+    b = _make_account("b", "www.workbuddy.ai")
+    c = _make_account("c", "www.workbuddy.ai")
+    for aid in (a, b, c):
+        auth_manager.record_account_models(aid, ["paid-model"])
+    for aid in (a, b, c):
+        _serve(aid, 5, model="paid-model", credit=2.5)   # 每次 0.5，真的扣积分
+    auth_manager.forget_cost_profile()
+
+    _seed_expiring(a, amount=217, days=8)
+    _seed_expiring(b, amount=136, days=8)
+    _seed_expiring(c, amount=280, days=13)
+
+    urgent = auth_manager._most_urgent_expiring(
+        [db.get_account(a), db.get_account(b), db.get_account(c)], "paid-model"
+    )
+    assert {acc["id"] for acc in urgent} == {a, b}
+
+
+def test_expiring_preference_waits_for_billing_evidence():
+    """没有计费样本时不下结论：不启用到期优先，回到负载均衡。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    b = _make_account("b", "www.workbuddy.cn")
+    auth_manager.record_account_models(a, ["unknown-model"])
+    auth_manager.record_account_models(b, ["unknown-model"])
+    _seed_expiring(a, amount=1000, days=2)
+    _seed_expiring(b, amount=1000, days=20)
+
+    assert auth_manager._most_urgent_expiring(
+        [db.get_account(a), db.get_account(b)], "unknown-model"
+    ) == []
 
 
 def test_expiring_preference_ignores_accounts_without_cached_quota():
@@ -889,6 +970,8 @@ def test_expiring_preference_ignores_accounts_without_cached_quota():
     untracked = _make_account("untracked", "www.workbuddy.cn")
     auth_manager.record_account_models(tracked, ["m"])
     auth_manager.record_account_models(untracked, ["m"])
+    _seed_billing(tracked, "m", unit_price=0.5)
+    _seed_billing(untracked, "m", unit_price=0.5)
 
     _seed_expiring(tracked, amount=1000, days=3)
     # untracked 完全没有缓存记录；它仍然在候选里，只是不参与「谁更急」的比较
@@ -907,6 +990,8 @@ def test_expiry_urgency_has_slack_to_avoid_starvation():
     b = _make_account("b", "www.workbuddy.cn")
     auth_manager.record_account_models(a, ["m"])
     auth_manager.record_account_models(b, ["m"])
+    _seed_billing(a, "m", unit_price=0.5)
+    _seed_billing(b, "m", unit_price=0.5)
     _seed_expiring(a, amount=1000, days=10.0)
     _seed_expiring(b, amount=1000, days=10.5)   # 0.5 天差距 < 1 天容差
 
@@ -926,6 +1011,8 @@ def test_expiry_beats_load_but_not_priority():
     auth_manager.record_account_models(low, ["m"])
     db.update_account(high, {"priority": 10})
     db.update_account(low, {"priority": 0})
+    _seed_billing(high, "m", unit_price=0.5)
+    _seed_billing(low, "m", unit_price=0.5)
 
     _seed_expiring(low, amount=1000, days=1)    # low 更急，但优先级低
     _seed_expiring(high, amount=1000, days=20)
@@ -939,6 +1026,8 @@ def test_expired_or_failed_quota_cache_does_not_steer_routing():
     b = _make_account("b", "www.workbuddy.cn")
     auth_manager.record_account_models(a, ["m"])
     auth_manager.record_account_models(b, ["m"])
+    _seed_billing(a, "m", unit_price=0.5)
+    _seed_billing(b, "m", unit_price=0.5)
 
     # 刷新失败（ok=False）→ 不参与
     _seed_expiring(a, amount=9999, days=1, ok=False)
@@ -963,6 +1052,8 @@ def test_all_accounts_equally_urgent_falls_back_to_load_balancing():
     b = _make_account("b", "www.workbuddy.cn")
     auth_manager.record_account_models(a, ["m"])
     auth_manager.record_account_models(b, ["m"])
+    _seed_billing(a, "m", unit_price=0.5)
+    _seed_billing(b, "m", unit_price=0.5)
     _seed_expiring(a, amount=500, days=5)
     _seed_expiring(b, amount=500, days=5)
 
