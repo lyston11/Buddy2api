@@ -64,20 +64,43 @@ def site_for_domain(domain) -> str:
 
 
 def available_sites() -> list[dict]:
-    """站点清单（含各自已导入账号数），供前端选站点。"""
-    counts: dict[str, int] = {}
+    """站点清单（含各自账号与状态），供前端选站点。
+
+    为什么不只给数量：无感登录的授权链接是**通用**的 —— 最终授权成哪个账号由
+    浏览器当前登录的身份决定，网关事先无从得知（uid 要等授权完成才由官方返回）。
+    所以界面必须让用户看到「这个站点有哪些账号、哪个已经好了、哪个还要重新登录」，
+    否则点开链接后无法判断这次授权会落到谁身上（2026-09-23 用户反馈）。
+    """
+    by_site: dict[str, list[dict]] = {}
     for account in db.list_accounts(provider="workbuddy"):
         group = site_for_domain(account.get("domain"))
-        counts[group] = counts.get(group, 0) + 1
-    return [
-        {
+        by_site.setdefault(group, []).append({
+            "id": account.get("id"),
+            "name": account.get("nickname") or account.get("name") or "",
+            "status": account.get("status") or "",
+            "uid_masked": _mask_uid(account.get("uid")),
+        })
+    out = []
+    for group in sites.SITE_GROUPS:
+        # 需要重新登录的排前面，前端一眼能看出还差谁
+        rows = sorted(by_site.get(group, []), key=lambda a: (a["status"] == "active", a["id"] or 0))
+        out.append({
             "site": group,
             "api_host": SITE_ENDPOINTS[group][0],
             "platform": SITE_ENDPOINTS[group][1],
-            "account_count": counts.get(group, 0),
-        }
-        for group in sites.SITE_GROUPS
-    ]
+            "account_count": len(rows),
+            "pending_count": sum(1 for a in rows if a["status"] != "active"),
+            "accounts": rows,
+        })
+    return out
+
+
+def _mask_uid(uid) -> str:
+    value = str(uid or "")
+    if len(value) <= 12:
+        return value
+    return f"{value[:6]}…{value[-4:]}"
+
 
 
 def _endpoint(site: str) -> tuple[str, str]:
@@ -117,11 +140,16 @@ def _purge(now: Optional[float] = None) -> None:
             _flows.pop(key, None)
 
 
-def start(site: str = DEFAULT_SITE) -> dict:
-    """申请 state 与授权链接。返回 {login_id, auth_url, expires_in, site, platform}。
+def start(site: str = DEFAULT_SITE, expect_uid: str = "") -> dict:
+    """申请 state 与授权链接。返回 {login_id, auth_url, expires_in, site, platform, expect_uid}。
 
     `site` 决定打哪个 host、用哪个 platform 标识；轮询沿用发起时的选择，
     所以国际版账号不会被送到国内站授权。
+
+    `expect_uid`：本次想恢复的账号 uid（界面上点某个账号的「重新登录」时会带上）。
+    OAuth 链接本身无法指定身份 —— 授权成谁由浏览器当前登录态决定，所以这里只做
+    **事后核对**：授权回来的 uid 与 expect_uid 不一致时，poll 会给出 `uid_matched=false`
+    并说明实际落到哪个账号，避免用户以为"点的是 A，登的却是 B"。
     """
     _purge()
     host, platform = _endpoint(site)
@@ -143,6 +171,7 @@ def start(site: str = DEFAULT_SITE) -> dict:
         "platform": platform,
         "api_base": api_base,
         "state": state,
+        "expect_uid": str(expect_uid or ""),
         "created_at": time.time(),
         "expires_at": time.time() + FLOW_TIMEOUT_SECONDS,
         "done": False,
@@ -155,6 +184,76 @@ def start(site: str = DEFAULT_SITE) -> dict:
         "expires_in": FLOW_TIMEOUT_SECONDS,
         "site": site,
         "platform": platform,
+        "expect_uid": str(expect_uid or ""),
+    }
+
+
+def account_name_for_uid(uid: str) -> str:
+    """按 uid 找账号显示名（用于界面提示"这次要登的是谁"）。"""
+    target = str(uid or "")
+    if not target:
+        return ""
+    for account in db.list_accounts(provider="workbuddy"):
+        if str(account.get("uid") or "") == target:
+            return str(account.get("nickname") or account.get("name") or "")
+    return ""
+
+
+def site_for_uid(uid: str) -> str:
+    """按 uid 找该账号所属站点（界面点账号的「重新登录」时用它决定 host）。"""
+    target = str(uid or "")
+    for account in db.list_accounts(provider="workbuddy"):
+        if str(account.get("uid") or "") == target:
+            return site_for_domain(account.get("domain"))
+    return DEFAULT_SITE
+
+
+def pending_accounts() -> list[dict]:
+    """列出需要重新登录的账号（非 active），附各自站点。"""
+    out = []
+    for account in db.list_accounts(provider="workbuddy"):
+        status = str(account.get("status") or "")
+        if status == "active":
+            continue
+        group = site_for_domain(account.get("domain"))
+        out.append({
+            "id": account.get("id"),
+            "name": account.get("nickname") or account.get("name") or "",
+            "status": status,
+            "site": group,
+            "api_host": SITE_ENDPOINTS[group][0],
+            "platform": SITE_ENDPOINTS[group][1],
+            "uid": str(account.get("uid") or ""),
+            "uid_masked": _mask_uid(account.get("uid")),
+        })
+    return out
+
+
+def start_for_pending() -> dict:
+    """一键给所有「需要登录」的账号各生成一个授权链接。
+
+    界面一次点击就该拿到「谁要登录 + 去哪儿登」，不该让用户先理解"站点"这种实现
+    细节 —— 站点从账号的 domain 推导即可（2026-09-23 用户要求）。
+    每个账号一条 flow：OAuth 一次授权只能确定一个身份，无法批量。
+    """
+    pending = pending_accounts()
+    flows = []
+    for item in pending:
+        try:
+            started = start(site=item["site"], expect_uid=item["uid"])
+        except SeamlessLoginError as exc:
+            flows.append({**item, "error": str(exc)[:200]})
+            continue
+        flows.append({
+            **item,
+            "login_id": started["login_id"],
+            "auth_url": started["auth_url"],
+            "expires_in": started["expires_in"],
+        })
+    return {
+        "pending": flows,
+        "pending_count": len(flows),
+        "all_active": len(pending) == 0,
     }
 
 
@@ -280,10 +379,15 @@ def _poll_locked(flow: dict) -> dict:
         return {"status": "error", "error": flow["error"]}
 
     flow["done"] = True
+    expect = str(flow.get("expect_uid") or "")
     flow["result"] = {
         **written,
         "uid": uid,
         "nickname": str(account.get("nickname") or ""),
+        # 事后核对：OAuth 链接无法指定身份，浏览器登录态决定授权成谁。
+        # 与预期不符时前端要明确报警，避免用户以为"点的是 A，登的却是 B"。
+        "expected_name": account_name_for_uid(expect) if expect else "",
+        "uid_matched": (not expect) or (uid == expect),
     }
     return {"status": "done", **flow["result"]}
 

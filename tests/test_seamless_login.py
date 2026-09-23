@@ -270,3 +270,94 @@ def test_available_sites_counts_accounts_per_site():
     assert sites["domestic"]["account_count"] == 2
     assert sites["domestic"]["api_host"] == "https://www.workbuddy.cn"
     assert sites["domestic"]["platform"] == "workbuddy"
+
+
+# ------------------------------------------------------------
+# 账号维度的一键发起（2026-09-23 用户要求：点一下直接给"要登录的账号 + 链接"）
+# ------------------------------------------------------------
+
+def test_pending_accounts_lists_only_non_active_with_site():
+    # 用真实形状的 uid（UUID）：短字符串不会被掩码，测不出脱敏
+    intl_uid = "83271bf2-9fa6-4015-9210-a402a8c015f4"
+    db.add_account({"name": "expired-intl", "uid": intl_uid, "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    db.add_account({"name": "ok-domestic", "uid": "57f4638b-9ef1-4df4-a8e7-d1e4d0b26d28",
+                    "status": "active", "domain": "www.workbuddy.cn", "access_token": "t"})
+
+    rows = sl.pending_accounts()
+
+    assert [r["name"] for r in rows] == ["expired-intl"]
+    assert rows[0]["site"] == "international"
+    assert rows[0]["platform"] == "workbuddy-ai"
+    assert rows[0]["uid"] == intl_uid
+    assert rows[0]["uid_masked"] == "83271b…15f4", "uid 要脱敏后再给界面"
+
+
+def test_start_for_pending_returns_link_per_account(monkeypatch):
+    db.add_account({"name": "a-intl", "uid": "uid-a", "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    db.add_account({"name": "b-dom", "uid": "uid-b", "status": "inactive",
+                    "domain": "www.workbuddy.cn", "access_token": "t"})
+    calls = []
+
+    def fake_http(url, method="GET", body=None, headers=None, timeout=30):
+        calls.append(url)
+        platform = url.split("platform=")[1]
+        return {"code": 0, "data": {"state": f"st-{platform}", "authUrl": f"https://x/{platform}"}}
+
+    monkeypatch.setattr(sl, "_http_json", fake_http)
+
+    out = sl.start_for_pending()
+
+    assert out["all_active"] is False and out["pending_count"] == 2
+    sites_used = {row["site"] for row in out["pending"]}
+    assert sites_used == {"international", "domestic"}, "每个账号必须打到自己的站点"
+    assert all(row["auth_url"] for row in out["pending"])
+    assert all(row["login_id"] for row in out["pending"])
+    # 国际账号走 workbuddy-ai、国内走 workbuddy
+    assert any("workbuddy-ai" in url for url in calls) and any("platform=workbuddy" in url for url in calls)
+
+
+def test_start_for_pending_all_active(monkeypatch):
+    db.add_account({"name": "ok", "uid": "uid-ok", "status": "active",
+                    "domain": "www.workbuddy.cn", "access_token": "t"})
+
+    def _boom(*a, **kw):
+        raise AssertionError("全部激活时不应打上游")
+
+    monkeypatch.setattr(sl, "_http_json", _boom)
+
+    out = sl.start_for_pending()
+    assert out["all_active"] is True and out["pending_count"] == 0 and out["pending"] == []
+
+
+def test_poll_reports_uid_mismatch(monkeypatch):
+    """点的是 A 账号、浏览器却登成 B：必须回报 uid_matched=false 让界面报警。"""
+    db.add_account({"name": "target-a", "uid": "uid-target", "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    db.add_account({"name": "other-b", "uid": "uid-other", "status": "active",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    token_ok, account_ok = _token_response(uid="uid-other", nickname="other-b")
+    fake = _fake_http([{"code": 0, "data": {"state": "st-x"}}, token_ok, account_ok])
+    monkeypatch.setattr(sl, "_http_json", fake)
+
+    flow = sl.start(site="international", expect_uid="uid-target")
+    out = sl.poll(flow["login_id"])
+
+    assert out["status"] == "done"
+    assert out["uid_matched"] is False
+    assert out["expected_name"] == "target-a"
+
+
+def test_poll_reports_uid_match(monkeypatch):
+    db.add_account({"name": "target-a", "uid": "uid-target", "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    token_ok, account_ok = _token_response(uid="uid-target", nickname="target-a")
+    fake = _fake_http([{"code": 0, "data": {"state": "st-y"}}, token_ok, account_ok])
+    monkeypatch.setattr(sl, "_http_json", fake)
+
+    flow = sl.start(site="international", expect_uid="uid-target")
+    out = sl.poll(flow["login_id"])
+
+    assert out["status"] == "done" and out["uid_matched"] is True
+    assert out["nickname"] == "target-a"
