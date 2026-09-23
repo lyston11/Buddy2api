@@ -229,6 +229,34 @@ Agent clients can send top-level `reasoning_effort` to Chat Completions and the 
 
 Chat streams preserve `reasoning_content`. Responses streams expose standard `response.reasoning_summary_*` events and accept valid reasoning-only completions.
 
+### Using it from OpenCode
+
+Register the gateway as an OpenCode provider (`apiKey` is your own key; list the model ids you want under `models`):
+
+```json
+{
+  "provider": {
+    "workbuddy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "sk-cb-your-key"
+      },
+      "models": {
+        "auto": { "name": "WorkBuddy Auto" },
+        "glm-5.2": { "name": "GLM-5.2" }
+      }
+    }
+  }
+}
+```
+
+```bash
+opencode run -m workbuddy/auto "hello"
+```
+
+Use a separate key per channel: QwenWork, QClaw, and TraeWork each need their own.
+
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Content-Type: application/json" \

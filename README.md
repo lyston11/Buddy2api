@@ -49,8 +49,8 @@
 1. **启动后账号页是空的，这是正常的** —— 2.0 起不再自动入库。选通道 → 重新检测 → 一键导入。
 2. **一把 API Key 只打一个通道**（创建时必须选通道，通道与模型对不上会 400/403，不会自动转到别家）。也可以**把 Key 钉在某个账号上**：请求只走那个账号，该账号不可用时直接失败（503 `channel_unavailable`）、**不会静默换号**。不填就是自动选号。
 3. **某个通道返回 503 `channel_unavailable`**：该通道还没有可用账号——先确认是不是钉住的账号挂了。
-4. **QClaw / QwenWork 要在 Windows 上直接跑** `python -m buddy2api`;Linux Docker 读不了这两家 DPAPI 加密的登录文件。WorkBuddy 不受影响。
-5. **客户端最好和网关同一台机器**；客户端在 Docker 里时 Base URL 填 `http://host.docker.internal:8787/v1`,不要填 `127.0.0.1`。
+4. **QClaw / QwenWork 要在 Windows 上直接跑** `python -m buddy2api`；Linux Docker 读不了这两家 DPAPI 加密的登录文件。WorkBuddy 不受影响。
+5. **客户端最好和网关同一台机器**；客户端在 Docker 里时 Base URL 填 `http://host.docker.internal:8787/v1`，不要填 `127.0.0.1`。
 
 
 ## 安装与启动
@@ -65,10 +65,10 @@ python3 -m venv .venv                      # Windows: python -m venv .venv
 .venv/bin/python -m buddy2api              # Windows: .venv\Scripts\python -m buddy2api
 ```
 
-看到监听信息后打开 `http://127.0.0.1:8787`;`Ctrl+C` 停止。**改完代码或 `git pull` 后要重启才生效**。
+看到监听信息后打开 `http://127.0.0.1:8787`；`Ctrl+C` 停止。**改完代码或 `git pull` 后要重启才生效**。
 
-- 习惯 conda 的话把上面三行换成 `conda create -n buddy2api python=3.12 -y && conda activate buddy2api`,再 `pip install -r requirements.txt` 与 `python -m buddy2api`。
-- 一键脚本：Windows `.\scripts\start.bat`;Linux / macOS `chmod +x scripts/start.sh && ./scripts/start.sh`（优先用名为 `buddy2api` 的 conda 环境，没有才建 `.venv`）。
+- 习惯 conda 的话把上面三行换成 `conda create -n buddy2api python=3.12 -y && conda activate buddy2api`，再 `pip install -r requirements.txt` 与 `python -m buddy2api`。
+- 一键脚本：Windows `.\scripts\start.bat`；Linux / macOS `chmod +x scripts/start.sh && ./scripts/start.sh`（优先用名为 `buddy2api` 的 conda 环境，没有才建 `.venv`）。
 - Docker：`powershell -ExecutionPolicy Bypass -File .\scripts\start-docker-win.ps1`。容器里 QClaw / QwenWork 读不了 DPAPI 登录文件，请改用上面的 `python -m buddy2api`。
 
 ### 更新
@@ -98,7 +98,7 @@ CB_GATEWAY_ADMIN_TOKEN=cb-admin-请换成足够长的随机值 python -m buddy2a
 - **403 `key_channel_mismatch`**：模型带了别的通道前缀。**400 `unknown_model`**：模型不属于这把 Key 的通道。
 - **创建 Key 失败**：没选通道。
 - **`No module named ...`**：虚拟环境没激活，或没装 `requirements.txt`。**端口被占用**：`python -m buddy2api --port 8788`。
-- WorkBuddy 聚合响应在缺少完成标记时返回上游错误，不再把部分正文当正常 `stop`;明确的 `finish_reason` 后直接 EOF 仍接受，仅收到 `[DONE]` 而没有结束原因不算正常完成。该校验不能判断模型主动 `stop` 是否过早，也不保证解决所有长会话停转。
+- WorkBuddy 聚合响应在缺少完成标记时返回上游错误，不再把部分正文当正常 `stop`；明确的 `finish_reason` 后直接 EOF 仍接受，仅收到 `[DONE]` 而没有结束原因不算正常完成。该校验不能判断模型主动 `stop` 是否过早，也不保证解决所有长会话停转。
 
 ### 账号很多时只打在一两个账号上？
 
@@ -191,7 +191,7 @@ refs:
   BUDDY2API_KEY: sk-cb-你的Key
 ```
 
-**2. 两个 profile 都要加 provider**（`~/.dsh/profiles/web/cordis.patch.yml` **和** `headless/`;只加一个的话另一个 profile 里选不到模型）：
+**2. 两个 profile 都要加 provider**（`~/.dsh/profiles/web/cordis.patch.yml` **和** `headless/`；只加一个的话另一个 profile 里选不到模型）：
 
 ```yaml
 - id: llm-pi-ai
@@ -239,16 +239,44 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 
 ### 思考强度
 
-Chat Completions 发顶层 `reasoning_effort`,Responses 发标准的 `reasoning: {"effort": "high"}`。网关也兼容 OpenCode / DSH / Cherry / Claude 风格的 `reasoning.effort`、`reasoningEffort`、`thinking.type`、`thinking.effort`、`output_config.effort`、`enable_thinking`。档位取 `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `ultra`（`off` 等同 `none`）。
+Chat Completions 发顶层 `reasoning_effort`，Responses 发标准的 `reasoning: {"effort": "high"}`。网关也兼容 OpenCode / DSH / Cherry / Claude 风格的 `reasoning.effort`、`reasoningEffort`、`thinking.type`、`thinking.effort`、`output_config.effort`、`enable_thinking`。档位取 `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `ultra`（`off` 等同 `none`）。
 
 | 通道 | 实际能力 |
 |---|---|
-| WorkBuddy | DeepSeek V4 Pro/Flash 只有 `low` / `high` / `max`,标准档位投影到这三档；未指定默认 `high`（`CB_GATEWAY_DEFAULT_REASONING_EFFORT=off` 可关掉默认） |
+| WorkBuddy | DeepSeek V4 Pro/Flash 只有 `low` / `high` / `max`，标准档位投影到这三档；未指定默认 `high`（`CB_GATEWAY_DEFAULT_REASONING_EFFORT=off` 可关掉默认） |
 | QClaw | 统一转成 `reasoning_effort` 透传，档位是否生效由上游模型决定，不注入默认值 |
 | QwenWork | 协议只有 `is_reasoning` 开关：`none` 关闭、其它档位开启，分不出强度 |
 | TraeWork | 会话协议没有可验证的思考控制字段，暂不支持调档 |
 
-Chat 流保留 `reasoning_content`;Responses 流转换成标准 `response.reasoning_summary_*` 事件，只有推理、没有最终正文的有效响应也会正常完成。
+Chat 流保留 `reasoning_content`；Responses 流转换成标准 `response.reasoning_summary_*` 事件，只有推理、没有最终正文的有效响应也会正常完成。
+
+### 接入 OpenCode
+
+把网关加成 OpenCode 的 provider（`apiKey` 填自己那把 Key，`models` 里列要用的模型 id）：
+
+```json
+{
+  "provider": {
+    "workbuddy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "sk-cb-你的key"
+      },
+      "models": {
+        "auto": { "name": "WorkBuddy Auto" },
+        "glm-5.2": { "name": "GLM-5.2" }
+      }
+    }
+  }
+}
+```
+
+```bash
+opencode run -m workbuddy/auto "你好"
+```
+
+QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 
 ## 启动参数
 
