@@ -807,33 +807,45 @@ const app=createApp({
   // 无感登录：点一下就把「需要登录的账号 + 各自授权链接」直接摊开。
   // 站点不是用户该操心的事 —— 从账号的 domain 推出来即可（2026-09-23 用户要求）。
   const sl=ref(null),slBusy=ref(false);let slTimer=null;
-  const slSites=ref([]);
   const siteLabelOf=s=>s==='international'?'国际版 www.workbuddy.ai':(s==='domestic'?'国内版 www.workbuddy.cn':s||'');
+  // 轮询所有"等待授权"的行：统一入口，避免 openSeamless / addNewAccount 各写一份
+  function slStartPolling(){
+    if(slTimer)clearInterval(slTimer);
+    slTimer=setInterval(()=>{
+      if(!sl.value){stopSeamless();return}
+      let anyWaiting=false;
+      sl.value.rows.forEach(row=>{
+        if(row.status!=='waiting')return;
+        anyWaiting=true;
+        // 用绝对截止时间算剩余，而不是"每次减 1" —— 轮询间隔与秒数不是 1:1，
+        // 直接减会让界面比服务端 state 慢 1.5 倍（曾出现"显示还剩 200s、其实已过期"）
+        row.remain=Math.max(0,Math.ceil((row.deadline-Date.now())/1000));
+        if(row.remain<=0){row.status='failed';row.message='授权超时，请重新点「无感登录」'}
+        else pollRow(row);
+      });
+      if(!anyWaiting)stopSeamless();
+    },1500);
+  }
+  function makeSlRow(x,extra){
+    return Object.assign({
+      accountId:null,name:'-',site:'',siteLabel:'',uid:'',uidMasked:'',
+      loginId:'',authUrl:'',status:'waiting',message:'等待浏览器授权…',uidMatched:null,actualName:'',verifiable:true,
+      remain:Number((x&&x.expires_in)||600),
+      deadline:Date.now()+Number((x&&x.expires_in)||600)*1000,
+    },x||{},extra||{});
+  }
   async function openSeamless(){
     if(slBusy.value)return;slBusy.value=true;
     sl.value={status:'loading',rows:[],allActive:false,message:'正在向官方申请授权链接…'};
     try{
       const r=await api.post('/admin/accounts/seamless-login/start-pending',{},p.token);
-      const rows=(r.pending||[]).map(x=>({
+      const rows=(r.pending||[]).map(x=>makeSlRow(x,{
         accountId:x.id,name:x.name||x.uid_masked||'-',site:x.site,siteLabel:siteLabelOf(x.site),
-        uid:x.uid,uidMasked:x.uid_masked,loginId:x.login_id,authUrl:x.auth_url,
-        remain:Number(x.expires_in||600),status:x.error?'failed':'waiting',
-        message:x.error||'等待浏览器授权…',uidMatched:null,actualName:''
+        uid:x.uid,uidMasked:x.uid_masked,verifiable:x.verifiable!==false,loginId:x.login_id,authUrl:x.auth_url,
+        status:x.error?'failed':'waiting',message:x.error||'等待浏览器授权…',
       }));
       sl.value={status:'ready',rows,allActive:!!r.all_active,message:rows.length?'':'所有账号都已激活，无需登录'};
-      if(slTimer)clearInterval(slTimer);
-      if(rows.length)slTimer=setInterval(()=>{
-        if(!sl.value)return;
-        let anyWaiting=false;
-        sl.value.rows.forEach(row=>{
-          if(row.status!=='waiting')return;
-          anyWaiting=true;
-          row.remain=Math.max(0,row.remain-1);
-          if(row.remain<=0){row.status='failed';row.message='授权超时，请重新点「无感登录」'}
-          else pollRow(row);
-        });
-        if(!anyWaiting){stopSeamless()}
-      },1500);
+      slStartPolling();
     }catch(e){
       sl.value={status:'ready',rows:[],allActive:false,message:apiErr(e,'申请授权链接失败')};
       p.toast(apiErr(e,'申请授权链接失败'),'err');
@@ -849,8 +861,10 @@ const app=createApp({
         row.status='done';
         row.actualName=r.nickname||r.name||'';
         row.uidMatched=r.uid_matched!==false;
-        row.message=row.uidMatched?('已恢复'+(r.status_after?(' · '+r.status_after):'')):('授权成了「'+(row.actualName||'其他账号')+'」，与目标账号不一致 —— 请用无痕窗口重试');
-        if(row.uidMatched){p.toast('已恢复：'+(row.actualName||row.name),'ok')}else{p.toast('授权账号与目标不符：'+(row.actualName||'其他账号'),'err')}
+        if(row.verifiable===false)row.message='已恢复'+(r.status_after?(' · '+r.status_after):'')+'（该账号没有 uid，无法预先核对身份）';
+        else if(row.uidMatched)row.message='已恢复'+(r.status_after?(' · '+r.status_after):'');
+        else row.message='授权成了「'+(row.actualName||'其他账号')+'」，与目标账号不一致 —— 请用无痕窗口重试';
+        p.toast(row.uidMatched?('已恢复：'+(row.actualName||row.name)):('授权账号与目标不符：'+(row.actualName||'其他账号')),row.uidMatched?'ok':'err');
         await load();
       }else{
         row.status='failed';row.message=r.error||'授权失败';
@@ -859,40 +873,20 @@ const app=createApp({
     finally{row.polling=false}
   }
   function stopSeamless(){if(slTimer){clearInterval(slTimer);slTimer=null}}
-  async function loadSlSites(){
-    try{const r=await api.get('/admin/accounts/seamless-login/sites',p.token);slSites.value=r.sites||[]}catch(e){slSites.value=[]}
-  }
   async function addNewAccount(site){
     if(slBusy.value)return;slBusy.value=true;
     try{
       const r=await api.post('/admin/accounts/seamless-login/start',{site},p.token);
-      const row={accountId:null,name:'新账号（由浏览器登录态决定）',site:r.site,siteLabel:siteLabelOf(r.site),uid:'',uidMasked:'',
-        loginId:r.login_id,authUrl:r.auth_url,remain:Number(r.expires_in||600),status:'waiting',message:'等待浏览器授权…',uidMatched:null,actualName:''};
+      const row=makeSlRow(r,{name:'新账号（由浏览器登录态决定）',site:r.site,siteLabel:siteLabelOf(r.site),
+        loginId:r.login_id,authUrl:r.auth_url});
       if(!sl.value)sl.value={status:'ready',rows:[],allActive:true,message:''};
       sl.value={...sl.value,rows:[...sl.value.rows,row],allActive:false};
-      if(slTimer)clearInterval(slTimer);
-      slTimer=setInterval(()=>{if(!sl.value)return;let any=false;sl.value.rows.forEach(x=>{if(x.status!=='waiting')return;any=true;x.remain=Math.max(0,x.remain-1);if(x.remain<=0){x.status='failed';x.message='授权超时'}else pollRow(x)});if(!any)stopSeamless()},1500);
+      slStartPolling();
     }catch(e){p.toast(apiErr(e,'发起失败'),'err')}finally{slBusy.value=false}
   }
-  async function pollSeamless(){
-    const cur=sl.value;if(!cur||cur.status!=='waiting')return;
-    try{
-      const r=await api.get('/admin/accounts/seamless-login/poll?login_id='+encodeURIComponent(cur.loginId),p.token);
-      if(r.status==='pending')return;
-      stopSeamless();
-      if(r.status==='done'){
-        const label=(r.nickname||r.name||r.uid||'').slice(0,24);
-        const action=r.created?'已新增账号':'已更新账号';
-        const refresh=r.refreshed===false?(r.refresh_error?'（刷新失败：'+r.refresh_error+'）':'（刷新失败）'):'';
-        sl.value={...cur,status:'done',message:action+'「'+label+'」'+refresh,accountId:r.account_id,statusAfter:r.status_after||''};
-        p.toast(action+'：'+label,'ok');await load();
-      }else{
-        sl.value={...cur,status:'failed',message:r.error||'授权失败'};
-      }
-    }catch(e){stopSeamless();if(sl.value)sl.value={...sl.value,status:'failed',message:apiErr(e,'轮询失败')}}
-  }
   function closeSeamless(){stopSeamless();sl.value=null}
-  function copySlUrl(row){const u=row&&row.authUrl;if(!u)return;navigator.clipboard.writeText(u);p.toast('授权链接已复制','info')}
+  function slSafeUrl(u){const t=String(u||'');return /^https:\/\/www\.(workbuddy|codebuddy)\.(cn|ai)\//.test(t)?t:''}
+  function copySlUrl(row){const u=slSafeUrl(row&&row.authUrl);if(!u){p.toast('授权链接无效，请重新发起','err');return}navigator.clipboard.writeText(u);p.toast('授权链接已复制','info')}
   function hydrate(a){return {...a,_weight:a.weight||1,_priority:a.priority||0,_creditSnapshot:a.credit_snapshot||a.credit_limit||0,_baseWeight:a.weight||1,_basePriority:a.priority||0,_baseCreditSnapshot:a.credit_snapshot||a.credit_limit||0}}
   function dirty(a){return Number(a._weight||1)!==Number(a._baseWeight||1)||Number(a._priority||0)!==Number(a._basePriority||0)||Number(a._creditSnapshot||0)!==Number(a._baseCreditSnapshot||0)}
   function busyKey(id,k){return busy.value[id+'-'+k]}
@@ -999,7 +993,7 @@ const app=createApp({
   function expireText(x){if(x.expired)return '已过期';if(x.days_to_expire===null||x.days_to_expire===undefined)return x.expire_time||'长期';if(x.days_to_expire<0)return '已过期';if(x.days_to_expire<=7)return x.days_to_expire+' 天内';return shortTime(x.expire_time)}
   function pkgBadge(x){if(x.expired)return 'err';if(Number(x.days_to_expire)>=0&&Number(x.days_to_expire)<=7)return 'inactive';return 'ok'}
   function clearPath(){authPath.value='';discover('')}
-  onMounted(()=>{loadChannels();loadCatalogs();load(true);discover()});return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,testModels,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,load,loadCheckins,discover,scan,importSummary,add,ref2,saveMeta,toggle,openTest,closeTest,runTest,claimOne,claimAll,refreshAllResources,refreshResource,openPackages,refreshPackages,del,resetCounts,resetting,fmt,size,credit,tok,creditPct,claimText,officialBalance,officialHasValue,officialMain,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,shortTime,expireText,pkgBadge,siteLabel,clearPath,I,discChannel,channels,showFiles,discFiles,discAccounts,discUnimported,discLive,discBackups,sourceLabel,fileLabel,credByAccount,credSourceText,credSourceClass,sl,slBusy,closeSeamless,copySlUrl,slSites,siteLabelOf,openSeamless,addNewAccount}
+  onMounted(()=>{loadChannels();loadCatalogs();load(true);discover()});return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,testModels,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,load,loadCheckins,discover,scan,importSummary,add,ref2,saveMeta,toggle,openTest,closeTest,runTest,claimOne,claimAll,refreshAllResources,refreshResource,openPackages,refreshPackages,del,resetCounts,resetting,fmt,size,credit,tok,creditPct,claimText,officialBalance,officialHasValue,officialMain,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,shortTime,expireText,pkgBadge,siteLabel,clearPath,I,discChannel,channels,showFiles,discFiles,discAccounts,discUnimported,discLive,discBackups,sourceLabel,fileLabel,credByAccount,credSourceText,credSourceClass,sl,slBusy,closeSeamless,copySlUrl,slSafeUrl,siteLabelOf,openSeamless,addNewAccount}
 },template:`
 <div>
   <div class="phead"><h1>账号管理</h1><p>粘性主账号 · 失败自动切换</p></div>
@@ -1078,10 +1072,10 @@ const app=createApp({
     <div v-else>
       <table class="mini-table" v-if="sl.rows.length"><thead><tr><th>需要登录的账号</th><th>站点</th><th>状态</th><th>授权链接</th></tr></thead><tbody>
         <tr v-for="row in sl.rows" :key="row.loginId||row.name">
-          <td><div style="font-weight:600">{{row.name}}</div><div class="mono hint">{{row.uidMasked||'—'}}</div></td>
+          <td><div style="font-weight:600">{{row.name}}</div><div class="mono hint">{{row.uidMasked||'无 uid（不做身份核对）'}}</div></td>
           <td><span class="tag">{{row.siteLabel}}</span></td>
           <td><span class="badge" :class="row.status==='done'?(row.uidMatched===false?'err':'ok'):(row.status==='failed'?'err':'inactive')">{{row.status==='waiting'?('等待授权 '+row.remain+'s'):(row.status==='done'?(row.uidMatched===false?'账号不符':'已恢复'):'失败')}}</span><div class="hint" v-if="row.message" style="margin-top:3px;max-width:260px">{{row.message}}</div></td>
-          <td><div style="display:flex;gap:6px"><a class="btn s pri" :href="row.authUrl" target="_blank" rel="noopener" v-if="row.status==='waiting'">打开授权</a><button class="btn s" @click="copySlUrl(row)" v-if="row.status==='waiting'">复制</button><span class="hint" v-else>—</span></div></td>
+          <td><div style="display:flex;gap:6px"><a class="btn s pri" :href="slSafeUrl(row.authUrl)" target="_blank" rel="noopener" v-if="row.status==='waiting'&&slSafeUrl(row.authUrl)">打开授权</a><button class="btn s" @click="copySlUrl(row)" v-if="row.status==='waiting'">复制</button><span class="hint" v-else>—</span></div></td>
         </tr>
       </tbody></table>
     </div>

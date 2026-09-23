@@ -730,16 +730,22 @@ def _account_credential_sources(files: list[dict], accounts: list[dict]) -> list
     活跃凭据文件、备份数量，以及「仅数据库（靠刷新续期）」这类无文件账号。
     另外把本机有文件、库里却没有的 uid 单列成待导入行，避免漏掉可导入账号。
     """
+    # 按 uid 归桶。**uid 为空的文件不能归到任何账号**：否则一个 uid 为空的账号会
+    # 把所有无 uid 的文件都当成"自己的凭据文件"（实测会误报 source=file），
+    # 而真正的账号却看不到这些文件。空 uid 单独放 NO_UID 桶，最后按"待导入"列出。
+    NO_UID = "\x00no-uid"
     buckets: dict[str, dict] = {}
     for meta in files:
-        bucket = buckets.setdefault(meta.get("uid") or "", {"live": [], "backups": []})
+        uid = str(meta.get("uid") or "")
+        bucket = buckets.setdefault(uid or NO_UID, {"live": [], "backups": []})
         (bucket["backups"] if meta.get("is_backup") else bucket["live"]).append(meta)
 
     known_uids = {str(a.get("uid") or "") for a in accounts if a.get("uid")}
     rows: list[dict] = []
     for account in accounts:
         uid = str(account.get("uid") or "")
-        bucket = buckets.get(uid, {"live": [], "backups": []})
+        # 只有非空 uid 才允许认领文件
+        bucket = buckets.get(uid, {"live": [], "backups": []}) if uid else {"live": [], "backups": []}
         live = bucket["live"]
         usable = [m for m in live if not m.get("encrypted")]
         if usable:
@@ -762,14 +768,16 @@ def _account_credential_sources(files: list[dict], accounts: list[dict]) -> list
         })
 
     for uid, bucket in buckets.items():
-        if not uid or uid in known_uids:
+        if uid in known_uids:
             continue
         live = bucket["live"]
         if not live:
             continue
+        no_uid = uid == NO_UID
         rows.append({
             "id": None,
-            "name": live[0].get("account_name") or "未导入账号",
+            "name": ("未导入账号（文件缺 uid，无法自动归属）" if no_uid
+                     else (live[0].get("account_name") or "未导入账号")),
             "provider": "workbuddy",
             "status": "",
             "uid_masked": live[0].get("uid_masked") or "",

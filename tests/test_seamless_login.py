@@ -361,3 +361,60 @@ def test_poll_reports_uid_match(monkeypatch):
 
     assert out["status"] == "done" and out["uid_matched"] is True
     assert out["nickname"] == "target-a"
+
+
+# ------------------------------------------------------------
+# 自审补充（2026-09-23）：URL 来源加固 + 无 uid 账号不可核对
+# ------------------------------------------------------------
+
+def test_auth_url_rejects_untrusted_source():
+    """上游返回的链接不能原样透出（会被渲染成 <a href>），异站/非 https 一律回退。"""
+    host, platform, state = "https://www.workbuddy.cn", "workbuddy", "st-1"
+    fallback = f"{host}/login?platform={platform}&state={state}"
+
+    assert sl._safe_auth_url("javascript:alert(1)", host, platform, state) == fallback
+    assert sl._safe_auth_url("https://evil.example.com/login", host, platform, state) == fallback
+    assert sl._safe_auth_url("http://www.workbuddy.cn/login", host, platform, state) == fallback
+    assert sl._safe_auth_url(None, host, platform, state) == fallback
+    # 官方 OAuth 两个 host 放行
+    assert sl._safe_auth_url("https://www.workbuddy.ai/login?a=1", host, platform, state) == "https://www.workbuddy.ai/login?a=1"
+    # codebuddy 域名**刻意**不在授权 host 白名单里：sites.py 明确只把 *.workbuddy.* 当作
+    # 授权族（国际族更明确排除了 *.codebuddy.ai），所以它回退到本流程的 host，
+    # 不会把用户引到另一个站点的授权页。
+    assert sl._safe_auth_url("https://www.codebuddy.cn/login?a=1", host, platform, state) == fallback
+
+
+def test_start_falls_back_when_upstream_url_is_hostile(monkeypatch):
+    monkeypatch.setattr(sl, "_http_json", _fake_http([
+        {"code": 0, "data": {"state": "st-9", "authUrl": "javascript:alert(document.cookie)"}},
+    ]))
+    out = sl.start(site="international")
+    assert out["auth_url"].startswith("https://www.workbuddy.ai/login?platform=workbuddy-ai&state=st-9")
+
+
+def test_pending_account_without_uid_is_flagged_unverifiable():
+    """没有 uid 的账号无法在授权后核对身份，必须如实标记，不能假装核对过。"""
+    db.add_account({"name": "no-uid", "uid": "", "status": "expired",
+                    "domain": "www.workbuddy.cn", "access_token": "t"})
+    rows = [r for r in sl.pending_accounts() if r["name"] == "no-uid"]
+    assert rows and rows[0]["verifiable"] is False
+    assert rows[0]["uid"] == ""
+
+
+def test_write_credentials_refuses_empty_uid():
+    """空 uid 会匹配到"同样没 uid"的账号，把凭据写错人 —— 必须拒绝。"""
+    other = db.add_account({"name": "other", "uid": "", "status": "active", "access_token": "keep"})
+    with pytest.raises(sl.SeamlessLoginError):
+        sl._write_credentials("", {"accessToken": "new-token"}, {"nickname": "x"})
+    assert db.get_account(other)["access_token"] == "keep", "不得污染同类账号"
+
+
+def test_write_credentials_keeps_deadline_when_upstream_omits_it(monkeypatch):
+    """上游没给有效期时不要写"现在"，否则账号看上去立刻过期（比不更新更糟）。"""
+    aid = db.add_account({"name": "t", "uid": "uid-dl", "status": "active",
+                          "access_token": "old", "expires_at": 1899999999000})
+    sl._write_credentials("uid-dl", {"accessToken": "fresh", "domain": "www.workbuddy.ai"},
+                          {"nickname": "t"})
+    row = db.get_account(aid)
+    assert row["access_token"] == "fresh"
+    assert row["expires_at"] == 1899999999000, "拿不到新有效期时应保持原值"

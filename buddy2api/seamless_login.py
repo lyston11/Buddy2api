@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.request
 from typing import Optional
+from urllib.parse import urlparse
 
 import buddy2api.database as db
 import buddy2api.sites as sites
@@ -107,6 +108,30 @@ def _endpoint(site: str) -> tuple[str, str]:
     return SITE_ENDPOINTS.get(site) or SITE_ENDPOINTS[DEFAULT_SITE]
 
 
+_AUTH_URL_HOSTS = tuple(
+    host.split("://", 1)[1] for host, _platform in SITE_ENDPOINTS.values()
+)
+
+
+def _safe_auth_url(raw, host: str, platform: str, state: str) -> str:
+    """只接受已知站点的 https 授权链接，否则用 host+state 自己拼一个。
+
+    这个 URL 会直接进前端 `<a href>`,所以不能把上游返回的任意字符串原样透出
+    （异常/被篡改的响应可能给出 `javascript:` 之类）。合法来源只有官方两个站点。
+    """
+    fallback = f"{host}/login?platform={platform}&state={state}"
+    text = str(raw or "").strip()
+    if not text.startswith("https://"):
+        return fallback
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return fallback
+    if (parsed.hostname or "").lower() not in _AUTH_URL_HOSTS:
+        return fallback
+    return text
+
+
 def _http_json(url: str, method: str = "GET", body=None, headers: Optional[dict] = None, timeout: int = 30) -> dict:
     """最小 JSON 请求器。模块级函数，测试里整体替换即可不打网络。"""
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -159,11 +184,13 @@ def start(site: str = DEFAULT_SITE, expect_uid: str = "") -> dict:
     state = str(data.get("state") or "")
     if not state:
         raise SeamlessLoginError(f"auth/state 未返回 state（code={resp.get('code')}）")
-    auth_url = (
-        data.get("authUrl")
-        or data.get("auth_url")
-        or data.get("url")
-        or f"{host}/login?platform={platform}&state={state}"
+    # 上游给的链接不直接采信：只接受已知站点的 https 链接，否则回退到我们自己拼的。
+    # 该 URL 会被前端渲染成可点击的 <a href>，来源不可信时可能是 javascript: 之类。
+    auth_url = _safe_auth_url(
+        data.get("authUrl") or data.get("auth_url") or data.get("url"),
+        host,
+        platform,
+        state,
     )
     login_id = "sl_" + secrets.token_urlsafe(16)
     _flows[login_id] = {
@@ -216,6 +243,7 @@ def pending_accounts() -> list[dict]:
         if status == "active":
             continue
         group = site_for_domain(account.get("domain"))
+        uid = str(account.get("uid") or "")
         out.append({
             "id": account.get("id"),
             "name": account.get("nickname") or account.get("name") or "",
@@ -223,8 +251,10 @@ def pending_accounts() -> list[dict]:
             "site": group,
             "api_host": SITE_ENDPOINTS[group][0],
             "platform": SITE_ENDPOINTS[group][1],
-            "uid": str(account.get("uid") or ""),
-            "uid_masked": _mask_uid(account.get("uid")),
+            "uid": uid,
+            "uid_masked": _mask_uid(uid),
+            # 没有 uid 就无法在授权后核对身份，界面要如实说明（不能假装已核对）
+            "verifiable": bool(uid),
         })
     return out
 
@@ -271,15 +301,17 @@ def _norm_ms(value) -> Optional[int]:
     return int(value if value > 1e10 else value * 1000)
 
 
-def _resolve_deadline(token_data: dict, ms_key: str, in_key: str, fallback_seconds: float) -> int:
+def _resolve_deadline(token_data: dict, ms_key: str, in_key: str, fallback_seconds) -> Optional[int]:
+    """解析有效期（毫秒）。拿不到且未给 fallback 时返回 None —— 调用方据此决定不写。"""
     deadline = _norm_ms(token_data.get(ms_key)) or _norm_ms(token_data.get(ms_key.lower()))
     if deadline is None:
-        seconds = token_data.get(in_key)
         try:
-            seconds = float(seconds)
+            seconds = float(token_data.get(in_key))
         except (TypeError, ValueError):
-            seconds = 0.0
-        deadline = int(time.time() * 1000) + int((seconds or fallback_seconds) * 1000)
+            seconds = None
+        if not seconds and fallback_seconds is None:
+            return None
+        deadline = int(time.time() * 1000) + int((seconds or fallback_seconds or 0) * 1000)
     return deadline
 
 
@@ -289,6 +321,9 @@ def _write_credentials(uid: str, token_data: dict, account: dict, site: str = DE
     `site` 是发起授权时选定的站点：上游没回 `domain` 时用它对应的 host 兜底，
     避免把国际版账号的域名写成国内站（那会让后续请求打到错的上游）。
     """
+    if not str(uid or "").strip():
+        # 空 uid 会匹配到"同样没有 uid"的账号，把凭据写进别人身上；宁可报错
+        raise SeamlessLoginError("授权响应缺少 uid，拒绝写入（无法确定归属账号）")
     access = str(token_data.get("accessToken") or token_data.get("access_token") or "")
     refresh = str(token_data.get("refreshToken") or token_data.get("refresh_token") or "")
     if not access:
@@ -304,11 +339,18 @@ def _write_credentials(uid: str, token_data: dict, account: dict, site: str = DE
         "account_type": str(account.get("type") or "personal"),
         "access_token": access,
         "refresh_token": refresh,
-        "expires_at": _resolve_deadline(token_data, "expiresAt", "expiresIn", 0),
-        "refresh_expires_at": _resolve_deadline(token_data, "refreshExpiresAt", "refreshExpiresIn", 0),
+        "domain": domain,
         "domain": domain,
         "enterprise_id": str(account.get("enterpriseId") or ""),
     }
+    # 有效期拿不到就不写：写一个"现在"会让账号看上去立刻过期，比不更新更糟
+    for ms_key, in_key, field in (
+        ("expiresAt", "expiresIn", "expires_at"),
+        ("refreshExpiresAt", "refreshExpiresIn", "refresh_expires_at"),
+    ):
+        deadline = _resolve_deadline(token_data, ms_key, in_key, None)
+        if deadline:
+            parsed[field] = deadline
     session_state = token_data.get("sessionState") or token_data.get("session_state")
     if isinstance(session_state, str) and session_state:
         parsed["session_state"] = session_state

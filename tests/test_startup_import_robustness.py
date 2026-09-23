@@ -216,3 +216,24 @@ def test_discover_credential_sources_only_list_workbuddy_accounts(tmp_path):
     providers = {row["provider"] for row in view["accounts"]}
     assert providers == {"workbuddy"}, f"只应列出 WorkBuddy 账号，实际: {providers}"
     assert [row["name"] for row in view["accounts"]] == ["wb"]
+
+
+def test_uidless_file_is_not_claimed_by_account_without_uid(tmp_path):
+    """自审修复（2026-09-23）：uid 为空的文件不得被 uid 为空的账号认领。
+
+    原实现按 `meta["uid"] or ""` 归桶，于是「uid 为空的账号」会把所有缺 uid 的
+    文件都算成自己的凭据来源（实测误报 source=file），同时这些文件也不会出现在
+    「待导入」里 —— 既误报又漏报。
+    """
+    db.add_account({"name": "account-without-uid", "uid": "", "status": "active",
+                    "access_token": "t"})
+    _write_snapshot(tmp_path / "workbuddy-desktop-ai.info", "", "plain-token")
+
+    rows = auth_manager.discover_auth_files(str(tmp_path))["accounts"]
+    owner = next(r for r in rows if r["name"] == "account-without-uid")
+    orphans = [r for r in rows if r["id"] is None]
+
+    assert owner["source"] == "db" and owner["live_files"] == [], "缺 uid 的文件不得归给该账号"
+    assert len(orphans) == 1, "缺 uid 的文件应单列为待导入，而不是消失"
+    assert orphans[0]["live_files"] == ["workbuddy-desktop-ai.info"]
+    assert "uid" in orphans[0]["name"]
