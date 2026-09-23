@@ -41,33 +41,28 @@ Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 
 ## Install
 
-1. [Git](https://git-scm.com/downloads), [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/) (Python 3.12), and sign into Work Buddy / CodeBuddy at least once.
-2. Reopen the terminal, then:
+Requires **Python 3.12+** and **Git**; sign into WorkBuddy / CodeBuddy at least once first (or whichever client you plan to use).
 
-```powershell
-git --version
-conda --version
-git clone https://github.com/wicm84266964/Buddy2api.git
+```bash
+git clone https://github.com/lyston11/Buddy2api.git
 cd Buddy2api
-conda create -n buddy2api python=3.12 -y
-conda activate buddy2api
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m buddy2api
+python3 -m venv .venv                      # Windows: python -m venv .venv
+.venv/bin/pip install -r requirements.txt  # Windows: .venv\Scripts\pip install -r requirements.txt
+.venv/bin/python -m buddy2api              # Windows: .venv\Scripts\python -m buddy2api
 ```
 
-3. Open http://127.0.0.1:8787 → Accounts → Detect → Import → Test → API Keys (select a channel; pick Codex if the client is Codex) → point your client at `http://127.0.0.1:8787/v1`.
+Then open http://127.0.0.1:8787 → **Accounts** (pick channel → Detect → Import → Test) → **API Keys** (select the same channel, pick the Codex key type if the client is Codex) → point your client at `http://127.0.0.1:8787/v1`. `Ctrl+C` stops it; **a restart is required after code changes or `git pull`**.
 
-Windows script: `.\scripts\start.bat`. Docker helper: `.\scripts\start-docker-win.ps1` (WorkBuddy mount; use native Python for QClaw/QwenWork).
+- conda instead of venv: `conda create -n buddy2api python=3.12 -y && conda activate buddy2api`, then `pip install -r requirements.txt` and `python -m buddy2api`.
+- Helper scripts: `scripts/start.bat` (Windows), `chmod +x scripts/start.sh && ./scripts/start.sh` (Linux/macOS), `scripts/start-docker-win.ps1` (Docker; QClaw/QwenWork need native Python because their login files are DPAPI-encrypted).
 
-Later starts: `conda activate buddy2api` then `python -m buddy2api` in the project directory.
+Update: `git pull --ff-only && .venv/bin/pip install -r requirements.txt && .venv/bin/python -m buddy2api`.
 
 ## FAQ
 
 - WorkBuddy's collected responses, including the default tool-stall retry path, reject partial text without completion metadata instead of synthesizing a successful `stop`. An explicit `finish_reason` followed by EOF remains valid without `[DONE]`. A `[DONE]` event alone does not make text without a finish reason complete. This validation does not determine whether a model's explicit `stop` is premature or resolve every long-session stall.
 
-- `conda` not found: use Miniconda Prompt, or `conda init powershell` and reopen the terminal.
-- `No module named ...`: activate `buddy2api`, then `python -m pip install -r requirements.txt`.
+- Virtualenv not active / `No module named ...`: activate it and `pip install -r requirements.txt`.
 - Port 8787 in use: stop the old process or `python -m buddy2api --port 8788`.
 - No accounts in the UI: import has not been run yet.
 - Key create fails: the channel dropdown is required.

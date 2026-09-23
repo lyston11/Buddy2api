@@ -2,156 +2,89 @@
 
 [English](README_EN.md) | 中文
 
-> 把本机已经登录的消费级 AI 客户端，接成 OpenAI 兼容接口，给 Codex、OpenCode、Cherry Studio、NextChat 等用。默认打开 Work Buddy / CodeBuddy、QClaw、千问办公（QwenWork）、TraeWork 四个通道；管理页下拉选其中一个。一次请求只走一个通道。
+> 把本机已登录的 Work Buddy / CodeBuddy、QClaw、千问办公（QwenWork）、TraeWork 客户端，接成 OpenAI 兼容接口（`http://127.0.0.1:8787/v1`），给 DSH、Codex、OpenCode、Cherry Studio 等用。一次请求只走一个通道。
 
-当前版本 **2.1.9**。这个项目只适合本机自用，不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
+当前版本 **2.1.9**。**只适合本机自用**：不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
 
-默认本机启动会自动打开管理页，无需填写管理 Token，重启后已有页面仍可直接使用。重复启动会打开已运行的同一实例；同一数据库不能同时由多个实例使用。后台服务可加 `--no-browser`。显式设置 `--admin-token` 或 `CB_GATEWAY_ADMIN_TOKEN` 时启用凭证管理模式；非本机监听必须设置该凭证，并在管理页设置中填写。客户端 API Key 和上游账号授权不受影响。
+本机启动自动打开管理页，无需填管理 Token（重复启动会打开同一实例；同一数据库不能同时被多个实例使用，后台跑可加 `--no-browser`）。显式设置 `--admin-token` 或 `CB_GATEWAY_ADMIN_TOKEN` 才启用凭证管理模式——**非本机监听必须设置它**，并在管理页设置里填一次。
 
 ## 这是什么？
 
-Buddy2api 在本机提供 `http://127.0.0.1:8787/v1`。你在官方客户端里登录并且还有额度，这个网关把本机登录导入进来，把请求转到对应厂商。普通客户端走 Chat Completions；Codex 走 `/v1/responses`，管理页把 Key 类型选成 Codex 时会做一轮内容清洗。
+网关读取本机官方客户端的登录凭据，把请求转发给对应厂商。普通客户端走 Chat Completions；Codex 走 `/v1/responses`（管理页把 Key 类型选成 Codex 会做一轮内容清洗）。
 
 **只想把 WorkBuddy 反代给 DSH（DeepSeek Harness）用**，按这条最短路径走：
 
 1. 启动网关 → 打开 `http://127.0.0.1:8787/`；
-2. 「账号」页导入本机 WorkBuddy 登录（没登录过、或账号显示 `expired` 时，点「无感登录」用浏览器授权即可，不必重装客户端）；
+2. 「账号」页导入本机 WorkBuddy 登录（账号显示 `expired` 时点「无感登录」用浏览器重新授权即可，不必重装客户端）；
 3. 「API Keys」页建一把通道为 `workbuddy` 的 Key；
 4. 按 [接入 DSH](#接入-dshdeepseek-harness) 把 Key 与 provider 填进 `~/.dsh`。
 
-四个通道默认都开。没装、没登录的通道，账号页检测为空，不会自动入库。
+四个通道默认都开，没登录的通道检测为空、不会入库：
 
-```powershell
-python -m buddy2api
-```
+| 通道 | 本机登录位置 |
+|---|---|
+| WorkBuddy / CodeBuddy | Windows `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth`；macOS `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth` |
+| QClaw | `%APPDATA%\QClaw` |
+| 千问办公 QwenWork | `%APPDATA%\QwenWorkCN` |
+| TraeWork | Windows `%APPDATA%\TRAE SOLO CN\User\globalStorage`；macOS `~/Library/Application Support/TRAE SOLO CN/User/globalStorage` |
 
-| 通道 | 默认 | 本机登录位置 |
-|---|---|---|
-| WorkBuddy / CodeBuddy | 开 | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth` |
-| QClaw | 开 | `%APPDATA%\QClaw` |
-| 千问办公 QwenWork | 开 | `%APPDATA%\QwenWorkCN` |
-| TraeWork | 开 | Windows：`%APPDATA%\TRAE SOLO CN\User\globalStorage`；macOS：`~/Library/Application Support/TRAE SOLO CN/User/globalStorage` |
-
-路径不对时可用 `CB_AUTH_DIR`、`CB_QCLAW_AUTH_DIR`、`CB_QWENWORK_AUTH_DIR`、`CB_TRAEWORK_AUTH_DIR` 指定。四个通道的登录文件不要混在同一个目录。只要其中一家时，可设 `CB_GATEWAY_PROVIDERS=workbuddy` 收窄。
+路径不对时用 `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR` 指定（四个通道的登录文件不要混在同一目录）；只要其中一家时设 `CB_GATEWAY_PROVIDERS=workbuddy` 收窄。
 
 ## 注意事项
 
-按下面「安装与启动」即可。这几条是 2.0 里最容易踩空的：
+1. **启动后账号页是空的，这是正常的** —— 2.0 起不再自动入库。选通道 → 重新检测 → 一键导入。
+2. **一把 API Key 只打一个通道**（创建时必须选通道，通道与模型对不上会 400/403，不会自动转到别家）。也可以**把 Key 钉在某个账号上**：请求只走那个账号，该账号不可用时直接失败（503 `channel_unavailable`）、**不会静默换号**。不填就是自动选号。
+3. **某个通道返回 503 `channel_unavailable`**：该通道还没有可用账号——先确认是不是钉住的账号挂了。
+4. **QClaw / QwenWork 要在 Windows 上直接跑** `python -m buddy2api`;Linux Docker 读不了这两家 DPAPI 加密的登录文件。WorkBuddy 不受影响。
+5. **客户端最好和网关同一台机器**；客户端在 Docker 里时 Base URL 填 `http://host.docker.internal:8787/v1`,不要填 `127.0.0.1`。
 
-1. **启动后账号页是空的，这是正常的。** 默认不再自动入库。到「账号」页：选通道 → 重新检测 → 一键导入。四个通道都能选。
-2. **一把 API Key 只打一个通道。** 创建时必须选通道。WorkBuddy 的 Key 发 `auto` / `glm-5.2`；QwenWork 的 Key 发 `auto` 或 `qwork-advanced`；TraeWork 的 Key 发 `auto` 或 `qwen-3.7-plus`。通道和模型对不上会 400 或 403，不会帮你转到另一家。
-
-   也可以**把一把 Key 钉在某个具体账号上**：创建或编辑 Key 时选一个账号，之后这把 Key 的请求只走那个账号，不再由调度挑选。想让某把 Key 单独消耗某个账号的额度时用它。绑定后如果该账号不可用（停用、冷却中、通道不符），请求会直接失败，**不会**静默换号——否则你会以为额度没动，其实已经在吃别的账号。不填就是默认的自动选号。
-
-   注意：这种失败目前和「通道里没有可用账号」共用同一个错误（503 `channel_unavailable`），看到它时记得先确认是不是钉住的账号挂了。
-3. **某个通道返回 503 `channel_unavailable`：** 这个通道还没导入可用账号。
-4. **QClaw / QwenWork 请在 Windows 上直接跑 `python -m buddy2api`。** Linux Docker 读不了这两家用 DPAPI 加密的本机文件；管理页会写明这一点。WorkBuddy 可以继续用 Docker。
-5. 本项目和聊天客户端最好在同一台电脑。客户端如果跑在 Docker 里，Base URL 填 `http://host.docker.internal:8787/v1`，不要填容器自己的 `127.0.0.1`。
 
 ## 安装与启动
 
-还没装环境时按这几步走。已经有虚拟环境的，装完 `requirements.txt` 后执行 `python -m buddy2api` 即可。
+需要 **Python 3.12+** 和 **Git**；并先登录你要用的官方客户端（至少 WorkBuddy / CodeBuddy）。
 
-### 1. 安装工具
-
-1. [Git](https://git-scm.com/downloads)，Windows 保持默认选项
-2. [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/)，推荐 Python 3.12
-3. 先打开并登录你要用的官方客户端（至少 Work Buddy / CodeBuddy）
-
-装完后**重新打开** PowerShell、Windows Terminal 或 Anaconda Prompt：
-
-```powershell
-git --version
-conda --version
-```
-
-找不到 `conda` 时，用开始菜单里的 **Anaconda Prompt / Miniconda Prompt**。也可以在那里执行 `conda init powershell`，关掉窗口再开。
-
-### 2. 克隆项目
-
-```powershell
-git clone https://github.com/wicm84266964/Buddy2api.git
+```bash
+git clone https://github.com/lyston11/Buddy2api.git
 cd Buddy2api
-Get-ChildItem README.md, requirements.txt, buddy2api
+python3 -m venv .venv                      # Windows: python -m venv .venv
+.venv/bin/pip install -r requirements.txt  # Windows: .venv\Scripts\pip install -r requirements.txt
+.venv/bin/python -m buddy2api              # Windows: .venv\Scripts\python -m buddy2api
 ```
 
-后面的命令都要在这个目录里执行。
+看到监听信息后打开 `http://127.0.0.1:8787`;`Ctrl+C` 停止。**改完代码或 `git pull` 后要重启才生效**。
 
-### 3. 用 Conda 启动（推荐）
-
-```powershell
-conda create -n buddy2api python=3.12 -y
-conda activate buddy2api
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m buddy2api
-```
-
-看到监听信息后，浏览器打开：
-
-```text
-http://127.0.0.1:8787
-```
-
-停止服务：回到终端按 `Ctrl+C`。下次开机后：
-
-```powershell
-cd <你的项目路径>\Buddy2api
-conda activate buddy2api
-python -m buddy2api
-```
-
-提示符前面应出现 `(buddy2api)`，再执行 `python -m pip`，避免装到系统 Python。
-
-### 其他启动方式
-
-- **脚本：** Windows 安装 Python 时勾选 Add Python to PATH，在项目目录执行 `.\scripts\start.bat`。Linux / macOS：`chmod +x scripts/start.sh && ./scripts/start.sh`。脚本优先用名为 `buddy2api` 的 Conda 环境，没有 Conda 才建 `.venv`。
-- **Docker：** `powershell -ExecutionPolicy Bypass -File .\scripts\start-docker-win.ps1`。本机没有 WorkBuddy 登录目录时脚本仍会启动。容器下拉里仍有四个通道，但 QClaw / QwenWork 请用上面的 `python -m buddy2api`。TraeWork 登录文件不是 DPAPI，本机 `python -m buddy2api` 导入后 Docker 也能用库里的 token。
-
-### 第一次打开网页之后
-
-本机管理页自动授权，不用粘贴 Token，也不依赖管理 Cookie。
-
-1. 打开「账号」，点击「一键导入全部通道」读取各启用通道的默认登录目录；也可先选择通道，再点击「导入当前通道」。自定义路径仅用于当前通道，留空使用默认目录，切换通道会清空路径。导入后逐通道显示结果，未登录的通道会跳过。
-2. 点该账号的「测试」，能返回一句话就说明这条通道通了。
-3. 打开「API Keys」，**先选同一个通道**再创建。给 Codex 用时 Key 类型选 Codex，接口用 `/v1/responses`。创建后可以再显示、复制完整 Key。
-4. 在客户端里填：
-   - Base URL：`http://127.0.0.1:8787/v1`
-   - API Key：刚复制的 Key
-   - 模型：WorkBuddy 用 `auto` 即可；QClaw 用 `auto`；千问办公用 `auto` 或 `qwork-advanced`；TraeWork 用 `auto` 或 `qwen-3.7-plus`。上游加了新模型时，到「模型配置」点「一键读取供应模型」；各通道目录分开保存，选错通道仍会 400/403。
-
-管理页打不开或要远程访问时：
-
-```powershell
-$env:CB_GATEWAY_ADMIN_TOKEN="cb-admin-请换成足够长的随机值"
-python -m buddy2api
-```
+- 习惯 conda 的话把上面三行换成 `conda create -n buddy2api python=3.12 -y && conda activate buddy2api`,再 `pip install -r requirements.txt` 与 `python -m buddy2api`。
+- 一键脚本：Windows `.\scripts\start.bat`;Linux / macOS `chmod +x scripts/start.sh && ./scripts/start.sh`（优先用名为 `buddy2api` 的 conda 环境，没有才建 `.venv`）。
+- Docker：`powershell -ExecutionPolicy Bypass -File .\scripts\start-docker-win.ps1`。容器里 QClaw / QwenWork 读不了 DPAPI 登录文件，请改用上面的 `python -m buddy2api`。
 
 ### 更新
 
-先 `Ctrl+C` 停掉正在跑的服务：
+```bash
+git pull --ff-only && .venv/bin/pip install -r requirements.txt && .venv/bin/python -m buddy2api
+```
 
-```powershell
-cd <你的项目路径>\Buddy2api
-git pull --ff-only
-conda activate buddy2api
-python -m pip install -r requirements.txt
-python -m buddy2api
+### 第一次打开网页之后
+
+本机管理页自动授权，不用粘 Token。
+
+1. 「账号」页选通道 → 重新检测 → 一键导入（未登录的通道会跳过）；点账号的「测试」能返回一句话就算通。
+2. 「API Keys」页**先选同一个通道**再创建；给 Codex 用就把 Key 类型选 Codex（走 `/v1/responses`）。
+3. 客户端里填 Base URL `http://127.0.0.1:8787/v1` + 复制的 Key + 模型 `auto`（也可填具体 id，如 `deepseek-v4.1-flash`、`glm-5.2`）。上游加了新模型时到「模型配置」点「一键读取供应模型」。
+
+要远程访问或管理页打不开时，用管理 Token 启动：
+
+```bash
+CB_GATEWAY_ADMIN_TOKEN=cb-admin-请换成足够长的随机值 python -m buddy2api   # Windows: $env:CB_GATEWAY_ADMIN_TOKEN="..."
 ```
 
 ## 常见问题
 
-- WorkBuddy 聚合响应（包括默认停转重试所用的工具续聊路径）在缺少完成标记时返回上游错误，不再把部分正文默认为正常 `stop`。明确的 `finish_reason` 后直接 EOF 仍被接受；仅收到 `[DONE]`、但正文没有结束原因时不会当作正常完成。此校验不能判定模型主动 `stop` 是否过早，也不保证解决所有长会话停转。
-
-- `git` 或 `conda` 不是内部命令：关掉终端重开；Conda 用户改用 Miniconda Prompt。
-- `No module named ...`：先 `conda activate buddy2api`，再 `python -m pip install -r requirements.txt`。
-- 下载依赖很慢：确认能访问 PyPI，不要混用好几个 Python。
-- 端口 8787 被占用：关掉旧的 Buddy2api，或 `python -m buddy2api --port 8788`。
-- 网页里一个账号都没有：还没导入。选对通道再检测；登录目录不对就设 `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR`。
-- 创建 Key 失败：没选通道。
-- 客户端 503 `channel_unavailable`：这个 Key 绑定的通道还没有可用账号；如果这把 Key 钉了具体账号，也可能是钉住的账号当前不可用（停用 / 冷却中 / 通道不符）。改绑、或把绑定清成「不绑定」回到自动选号。
-- 客户端 403 `key_channel_mismatch`：模型带了别的通道前缀，和当前 Key 不一致。
-- 客户端 400 `unknown_model`：模型不属于这把 Key 的通道。换 Key，或改成该通道认识的 id。
+- **账号页空 / 一个账号都没有**：还没导入。选对通道再检测；登录目录不对就设 `CB_AUTH_DIR` 等变量。
+- **503 `channel_unavailable`**：这个 Key 绑定的通道没有可用账号；钉了具体账号时也可能是那个账号暂时不可用（停用 / 冷却 / 通道不符）。改绑或清成「不绑定」回到自动选号。
+- **403 `key_channel_mismatch`**：模型带了别的通道前缀。**400 `unknown_model`**：模型不属于这把 Key 的通道。
+- **创建 Key 失败**：没选通道。
+- **`No module named ...`**：虚拟环境没激活，或没装 `requirements.txt`。**端口被占用**：`python -m buddy2api --port 8788`。
+- WorkBuddy 聚合响应在缺少完成标记时返回上游错误，不再把部分正文当正常 `stop`;明确的 `finish_reason` 后直接 EOF 仍接受，仅收到 `[DONE]` 而没有结束原因不算正常完成。该校验不能判断模型主动 `stop` 是否过早，也不保证解决所有长会话停转。
 
 ### 账号很多时只打在一两个账号上？
 
@@ -231,30 +164,20 @@ python -m buddy2api
 
 ### 接入 DSH（DeepSeek Harness）
 
-DSH 通过 OpenAI 兼容协议接进来，整条链路是：
-
 ```
-DSH ──(openai-completions, Bearer sk-cb-…)──▶ buddy2api 127.0.0.1:8787/v1 ──▶ WorkBuddy 上游
+DSH ──(openai-completions, Bearer sk-cb-…)──▶ 127.0.0.1:8787/v1 ──▶ WorkBuddy 上游
 ```
 
-**前置条件**（都在管理页完成，见上文「第一次打开网页之后」）：
+前置：网关在跑、账号页有 **active** 账号（失效就用「无感登录」重新授权）、已建一把 `workbuddy` 通道的 Key。
 
-1. 网关已启动，`http://127.0.0.1:8787/` 能打开；
-2. 「账号」页里有 **active** 账号 —— 一键导入本机登录，或账号失效时点「无感登录」用浏览器重新授权；
-3. 「API Keys」页创建一把 Key（通道选 `workbuddy`），复制 `sk-cb-…`。
-
-#### 1. 把 Key 写进 DSH 凭证
-
-DSH 的 provider 用**环境变量名**引用密钥，密钥本身放在 `~/.dsh/.credentials.yaml` 的 `refs:` 下：
+**1. Key 放进 `~/.dsh/.credentials.yaml`**（provider 用环境变量名引用它）：
 
 ```yaml
 refs:
   BUDDY2API_KEY: sk-cb-你的Key
 ```
 
-#### 2. 在两个 profile 里加 provider
-
-`~/.dsh/profiles/web/cordis.patch.yml` **和** `~/.dsh/profiles/headless/cordis.patch.yml` 都要改（只改一个的话，另一个 profile 里选不到这个模型）：
+**2. 两个 profile 都要加 provider**（`~/.dsh/profiles/web/cordis.patch.yml` **和** `headless/`;只加一个的话另一个 profile 里选不到模型）：
 
 ```yaml
 - id: llm-pi-ai
@@ -265,68 +188,28 @@ refs:
         api: openai-completions
         baseURL: http://127.0.0.1:8787/v1
         models:
-          - id: deepseek-v4.1-flash
+          - id: deepseek-v4.1-flash     # 也可写 auto，或 /v1/models 里的任意 id
             name: DeepSeek V4.1 Flash (WorkBuddy)
             input: [text, image]
-            contextWindow: 1000000
+            contextWindow: 1000000      # 给 DSH 看的预算，按需调整
             maxTokens: 65536
-            reasoningEfforts:
+            reasoningEfforts:           # 对应网关的思考档位，仅支持档位的模型需要
               off:
               low: low
               high: high
               max: max
 ```
 
-- `id` 填网关的模型名：`auto` 最省事（跟着 Key 绑定的通道自动选），也可填具体模型（如 `deepseek-v4.1-flash`、`glm-5.2`），模型清单见 `/v1/models` 或管理页「模型配置」；
-- `contextWindow` / `maxTokens` 是**给 DSH 看的上下文与输出预算**，按需调整；网关侧的容量以「一键读取供应模型」抓到的为准；
-- `reasoningEfforts` 对应网关的思考档位（`none`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`），只对支持档位的模型有意义。
-
-#### 3. 验证
+**3. 验证**（换成你的 Key，返回 `choices` 即通）：
 
 ```bash
-# 网关本身通不通（把 sk-cb-… 换成你的 Key）
 curl -s http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer sk-cb-你的Key" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"回复 ok"}],"max_tokens":20}'
 ```
 
-返回 `choices` 就说明整条链路通了。DSH 里则直接选到上面配的 `name` 发一句话即可。
-
-#### 想固定用某个账号？用「别名 + 绑定 Key」
-
-网关的调度默认在可用账号间自动负载均衡。若要把某类请求固定到某个账号（不同账号在不同站点的计费/额度不同），做法是**两件配套的事**：
-
-1. 「API Keys」创建一把 Key 并把 `default_account` 指到目标账号 —— 这是真正决定用哪个账号的地方；
-2. 「模型配置 → 模型别名」注册一个别名（如 `deepseek-v4.1-flash@acc-a` → `deepseek-v4.1-flash`），再在 DSH 里为这个别名单独配一个 provider，用第 1 步那把 Key。
-
-```yaml
-      wb-acc-a:
-        apiKeyEnv: WB_KEY_ACC_A        # .credentials.yaml 里对应这把绑定 Key
-        api: openai-completions
-        baseURL: http://127.0.0.1:8787/v1
-        models:
-          - id: deepseek-v4.1-flash@acc-a   # 网关侧注册过的别名
-            name: DeepSeek V4.1 Flash · acc-a
-```
-
-⚠️ **别名本身不绑定账号**。别名只负责"在 DSH 的模型选择里能单独列出来"，真正决定账号的是 Key 的 `default_account`。**用通用 Key 调 `@acc-a` 别名，请求不会落到 acc-a** —— 会照常走负载均衡。所以别名必须和绑定 Key 配套使用。
-
-作为对照，两者配套时的实测落点（`logs.account_name`）：
-
-| 模型 | Key | 实际落点 |
-|---|---|---|
-| `deepseek-v4.1-flash@acc-a` | 通用 Key（未绑账号） | 由负载均衡决定，**不保证**是 acc-a |
-| `deepseek-v4.1-flash@acc-a` | 绑定到 acc-a 的 Key | acc-a ✅ |
-
-#### 常见问题
-
-| 现象 | 原因与处理 |
-|---|---|
-| DSH 报模型不存在 / 401 | Key 没写进 `.credentials.yaml` 的 `refs:`，或 `apiKeyEnv` 名字对不上，或 Key 不是 `workbuddy` 通道 |
-| 只改了 `web` profile，headless 里没有 | 两个 profile 的 `cordis.patch.yml` 都要加 provider |
-| 请求都打到一个账号上 | 该账号是某个绑定 Key 的 `default_account`，或它被标记为只服务显式绑定（账号页的「凭据来源」列能看到）；国际站/国内站是两套账号，路由按模型与站点选择 |
-| 某个模型国际上免费、国内收费 | 两个站点是两套账号与计费，路由会按模型的站点偏好选择；国际账号失效时可能回落到收费的国内站，注意额度消耗（「Dashboard」的模型占比可按账号下钻）|
-| 账号突然 `expired` | 上游把 refresh token 判失效（常见于客户端换号登录）。账号页点「无感登录」用浏览器重新授权即可，不用重装 |
+**要固定用某个账号**：在「模型配置 → 模型别名」注册一个别名（如 `deepseek-v4.1-flash@acc-a` → `deepseek-v4.1-flash`），再建一把 `default_account` 指向该账号的 Key，然后在 DSH 里给这个别名单独配一个 provider、用那把 Key。
+⚠️ **别名本身不绑定账号**——用通用 Key 调 `@别名` 仍会走负载均衡。真正决定账号的是 **Key 的 `default_account`**。
 
 ### 模型容量与自动发现
 
@@ -342,57 +225,16 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 
 ### 思考强度
 
-智能体可以在 Chat Completions 中发送顶层 `reasoning_effort`，在 Responses 中发送标准的 `reasoning: {"effort": "high"}`。网关也兼容 OpenCode、DSH、Cherry 和 Claude 风格的 `reasoning.effort`、`reasoningEffort`、`thinking.type`、`thinking.effort`、`output_config.effort`、`enable_thinking` 等写法。可用档位为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；`off` 等同于 `none`。
-
-```json
-{
-  "model": "deepseek-v4-pro",
-  "messages": [{"role": "user", "content": "分析这个问题"}],
-  "reasoning_effort": "high"
-}
-```
+Chat Completions 发顶层 `reasoning_effort`,Responses 发标准的 `reasoning: {"effort": "high"}`。网关也兼容 OpenCode / DSH / Cherry / Claude 风格的 `reasoning.effort`、`reasoningEffort`、`thinking.type`、`thinking.effort`、`output_config.effort`、`enable_thinking`。档位取 `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `ultra`（`off` 等同 `none`）。
 
 | 通道 | 实际能力 |
 |---|---|
-| WorkBuddy | DeepSeek V4 Pro/Flash 支持 `low` / `high` / `max`，标准档位会投影到这三档；未指定时默认 `high`，可用 `CB_GATEWAY_DEFAULT_REASONING_EFFORT=off` 关闭默认 |
-| QClaw | 统一转换成 `reasoning_effort` 后透传；具体档位是否生效由所选上游模型决定，不额外注入默认值 |
-| QwenWork | 协议只有 `is_reasoning` 开关；`none` 关闭，其它显式档位开启，无法区分多档强度 |
-| TraeWork | 当前会话协议没有可验证的思考控制字段，因此暂不支持调档 |
+| WorkBuddy | DeepSeek V4 Pro/Flash 只有 `low` / `high` / `max`,标准档位投影到这三档；未指定默认 `high`（`CB_GATEWAY_DEFAULT_REASONING_EFFORT=off` 可关掉默认） |
+| QClaw | 统一转成 `reasoning_effort` 透传，档位是否生效由上游模型决定，不注入默认值 |
+| QwenWork | 协议只有 `is_reasoning` 开关：`none` 关闭、其它档位开启，分不出强度 |
+| TraeWork | 会话协议没有可验证的思考控制字段，暂不支持调档 |
 
-Chat 流会保留 `reasoning_content`。Responses 流会转换成标准的 `response.reasoning_summary_*` 事件，仅有推理、没有最终正文的有效响应也会正常完成。
-
-OpenCode 示例（WorkBuddy Key）：
-
-```json
-{
-  "provider": {
-    "workbuddy": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "http://127.0.0.1:8787/v1",
-        "apiKey": "sk-cb-你的key"
-      },
-      "models": {
-        "auto": { "name": "WorkBuddy Auto" },
-        "glm-5.2": { "name": "GLM-5.2" }
-      }
-    }
-  }
-}
-```
-
-```powershell
-opencode run -m workbuddy/auto "你好"
-```
-
-```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-cb-你的key" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}]}'
-```
-
-QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
+Chat 流保留 `reasoning_content`;Responses 流转换成标准 `response.reasoning_summary_*` 事件，只有推理、没有最终正文的有效响应也会正常完成。
 
 ## 启动参数
 
