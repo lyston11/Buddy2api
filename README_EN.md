@@ -2,6 +2,20 @@
 
 [English](README_EN.md) | [中文](README.md)
 
+---
+
+> ### ⚠️ Disclaimer
+>
+> This is a **personal learning and research project**, intended for **local, non-commercial use and study**. The author **does not encourage or authorise any commercial use** — including but not limited to offering it as a paid service, reselling it, bundling it into a commercial product, or running it in production.
+>
+> - It is **not affiliated with, authorised by, or endorsed by** WorkBuddy / CodeBuddy, QClaw, QwenWork, TraeWork or any other vendor. You are responsible for complying with their terms of service.
+> - Any consequences — **account risk controls, bans, lost credits** or otherwise — are **borne solely by the user**.
+> - Do not expose it publicly, and do not share credentials, API keys, or the database.
+>
+> Continued use means you accept the above. The code licence remains as stated in [LICENSE](LICENSE).
+
+---
+
 > Local consumer AI clients → one OpenAI-compatible API for Codex, OpenCode, Cherry Studio, NextChat, and similar agents. Work Buddy / CodeBuddy, QClaw, QwenWork, and TraeWork are on by default; pick one in the UI dropdown. Each request stays on one channel.
 
 Release **2.1.9**. Local use only. Do not expose this on the public internet, and do not share credentials, API keys, or the database.
