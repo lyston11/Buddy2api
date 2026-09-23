@@ -651,6 +651,16 @@ async def admin_scan_accounts(
 # 见 buddy2api/seamless_login.py 的模块说明。
 # ============================================================
 
+@app.post("/admin/accounts/seamless-login/start-pending")
+async def admin_seamless_login_start_pending(authorization: str | None = Header(default=None)):
+    """一键给所有「需要登录」的账号各生成授权链接（界面一次点击拿到全部链接）。"""
+    _check_admin(authorization)
+    try:
+        return await run_in_threadpool(seamless_login.start_for_pending)
+    except seamless_login.SeamlessLoginError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:240]) from exc
+
+
 @app.post("/admin/accounts/seamless-login/start")
 async def admin_seamless_login_start(
     request: Request,
@@ -661,8 +671,9 @@ async def admin_seamless_login_start(
     # 站点必须显式选：国内版与国际版的 OAuth 是两个 host，platform 标识也不同。
     # 不传时默认国内版；前端按已导入账号的站点分布预选。
     site = str((data or {}).get("site") or seamless_login.DEFAULT_SITE).strip()
+    expect_uid = str((data or {}).get("expect_uid") or "").strip()
     try:
-        return await run_in_threadpool(seamless_login.start, site)
+        return await run_in_threadpool(seamless_login.start, site, expect_uid)
     except seamless_login.SeamlessLoginError as exc:
         raise HTTPException(status_code=502, detail=str(exc)[:240]) from exc
 

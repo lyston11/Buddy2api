@@ -270,3 +270,151 @@ def test_available_sites_counts_accounts_per_site():
     assert sites["domestic"]["account_count"] == 2
     assert sites["domestic"]["api_host"] == "https://www.workbuddy.cn"
     assert sites["domestic"]["platform"] == "workbuddy"
+
+
+# ------------------------------------------------------------
+# 账号维度的一键发起（2026-09-23 用户要求：点一下直接给"要登录的账号 + 链接"）
+# ------------------------------------------------------------
+
+def test_pending_accounts_lists_only_non_active_with_site():
+    # 用真实形状的 uid（UUID）：短字符串不会被掩码，测不出脱敏
+    intl_uid = "83271bf2-9fa6-4015-9210-a402a8c015f4"
+    db.add_account({"name": "expired-intl", "uid": intl_uid, "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    db.add_account({"name": "ok-domestic", "uid": "57f4638b-9ef1-4df4-a8e7-d1e4d0b26d28",
+                    "status": "active", "domain": "www.workbuddy.cn", "access_token": "t"})
+
+    rows = sl.pending_accounts()
+
+    assert [r["name"] for r in rows] == ["expired-intl"]
+    assert rows[0]["site"] == "international"
+    assert rows[0]["platform"] == "workbuddy-ai"
+    assert rows[0]["uid"] == intl_uid
+    assert rows[0]["uid_masked"] == "83271b…15f4", "uid 要脱敏后再给界面"
+
+
+def test_start_for_pending_returns_link_per_account(monkeypatch):
+    db.add_account({"name": "a-intl", "uid": "uid-a", "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    db.add_account({"name": "b-dom", "uid": "uid-b", "status": "inactive",
+                    "domain": "www.workbuddy.cn", "access_token": "t"})
+    calls = []
+
+    def fake_http(url, method="GET", body=None, headers=None, timeout=30):
+        calls.append(url)
+        platform = url.split("platform=")[1]
+        return {"code": 0, "data": {"state": f"st-{platform}", "authUrl": f"https://x/{platform}"}}
+
+    monkeypatch.setattr(sl, "_http_json", fake_http)
+
+    out = sl.start_for_pending()
+
+    assert out["all_active"] is False and out["pending_count"] == 2
+    sites_used = {row["site"] for row in out["pending"]}
+    assert sites_used == {"international", "domestic"}, "每个账号必须打到自己的站点"
+    assert all(row["auth_url"] for row in out["pending"])
+    assert all(row["login_id"] for row in out["pending"])
+    # 国际账号走 workbuddy-ai、国内走 workbuddy
+    assert any("workbuddy-ai" in url for url in calls) and any("platform=workbuddy" in url for url in calls)
+
+
+def test_start_for_pending_all_active(monkeypatch):
+    db.add_account({"name": "ok", "uid": "uid-ok", "status": "active",
+                    "domain": "www.workbuddy.cn", "access_token": "t"})
+
+    def _boom(*a, **kw):
+        raise AssertionError("全部激活时不应打上游")
+
+    monkeypatch.setattr(sl, "_http_json", _boom)
+
+    out = sl.start_for_pending()
+    assert out["all_active"] is True and out["pending_count"] == 0 and out["pending"] == []
+
+
+def test_poll_reports_uid_mismatch(monkeypatch):
+    """点的是 A 账号、浏览器却登成 B：必须回报 uid_matched=false 让界面报警。"""
+    db.add_account({"name": "target-a", "uid": "uid-target", "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    db.add_account({"name": "other-b", "uid": "uid-other", "status": "active",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    token_ok, account_ok = _token_response(uid="uid-other", nickname="other-b")
+    fake = _fake_http([{"code": 0, "data": {"state": "st-x"}}, token_ok, account_ok])
+    monkeypatch.setattr(sl, "_http_json", fake)
+
+    flow = sl.start(site="international", expect_uid="uid-target")
+    out = sl.poll(flow["login_id"])
+
+    assert out["status"] == "done"
+    assert out["uid_matched"] is False
+    assert out["expected_name"] == "target-a"
+
+
+def test_poll_reports_uid_match(monkeypatch):
+    db.add_account({"name": "target-a", "uid": "uid-target", "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+    token_ok, account_ok = _token_response(uid="uid-target", nickname="target-a")
+    fake = _fake_http([{"code": 0, "data": {"state": "st-y"}}, token_ok, account_ok])
+    monkeypatch.setattr(sl, "_http_json", fake)
+
+    flow = sl.start(site="international", expect_uid="uid-target")
+    out = sl.poll(flow["login_id"])
+
+    assert out["status"] == "done" and out["uid_matched"] is True
+    assert out["nickname"] == "target-a"
+
+
+# ------------------------------------------------------------
+# 自审补充（2026-09-23）：URL 来源加固 + 无 uid 账号不可核对
+# ------------------------------------------------------------
+
+def test_auth_url_rejects_untrusted_source():
+    """上游返回的链接不能原样透出（会被渲染成 <a href>），异站/非 https 一律回退。"""
+    host, platform, state = "https://www.workbuddy.cn", "workbuddy", "st-1"
+    fallback = f"{host}/login?platform={platform}&state={state}"
+
+    assert sl._safe_auth_url("javascript:alert(1)", host, platform, state) == fallback
+    assert sl._safe_auth_url("https://evil.example.com/login", host, platform, state) == fallback
+    assert sl._safe_auth_url("http://www.workbuddy.cn/login", host, platform, state) == fallback
+    assert sl._safe_auth_url(None, host, platform, state) == fallback
+    # 官方 OAuth 两个 host 放行
+    assert sl._safe_auth_url("https://www.workbuddy.ai/login?a=1", host, platform, state) == "https://www.workbuddy.ai/login?a=1"
+    # codebuddy 域名**刻意**不在授权 host 白名单里：sites.py 明确只把 *.workbuddy.* 当作
+    # 授权族（国际族更明确排除了 *.codebuddy.ai），所以它回退到本流程的 host，
+    # 不会把用户引到另一个站点的授权页。
+    assert sl._safe_auth_url("https://www.codebuddy.cn/login?a=1", host, platform, state) == fallback
+
+
+def test_start_falls_back_when_upstream_url_is_hostile(monkeypatch):
+    monkeypatch.setattr(sl, "_http_json", _fake_http([
+        {"code": 0, "data": {"state": "st-9", "authUrl": "javascript:alert(document.cookie)"}},
+    ]))
+    out = sl.start(site="international")
+    assert out["auth_url"].startswith("https://www.workbuddy.ai/login?platform=workbuddy-ai&state=st-9")
+
+
+def test_pending_account_without_uid_is_flagged_unverifiable():
+    """没有 uid 的账号无法在授权后核对身份，必须如实标记，不能假装核对过。"""
+    db.add_account({"name": "no-uid", "uid": "", "status": "expired",
+                    "domain": "www.workbuddy.cn", "access_token": "t"})
+    rows = [r for r in sl.pending_accounts() if r["name"] == "no-uid"]
+    assert rows and rows[0]["verifiable"] is False
+    assert rows[0]["uid"] == ""
+
+
+def test_write_credentials_refuses_empty_uid():
+    """空 uid 会匹配到"同样没 uid"的账号，把凭据写错人 —— 必须拒绝。"""
+    other = db.add_account({"name": "other", "uid": "", "status": "active", "access_token": "keep"})
+    with pytest.raises(sl.SeamlessLoginError):
+        sl._write_credentials("", {"accessToken": "new-token"}, {"nickname": "x"})
+    assert db.get_account(other)["access_token"] == "keep", "不得污染同类账号"
+
+
+def test_write_credentials_keeps_deadline_when_upstream_omits_it(monkeypatch):
+    """上游没给有效期时不要写"现在"，否则账号看上去立刻过期（比不更新更糟）。"""
+    aid = db.add_account({"name": "t", "uid": "uid-dl", "status": "active",
+                          "access_token": "old", "expires_at": 1899999999000})
+    sl._write_credentials("uid-dl", {"accessToken": "fresh", "domain": "www.workbuddy.ai"},
+                          {"nickname": "t"})
+    row = db.get_account(aid)
+    assert row["access_token"] == "fresh"
+    assert row["expires_at"] == 1899999999000, "拿不到新有效期时应保持原值"
