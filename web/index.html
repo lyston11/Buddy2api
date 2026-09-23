@@ -828,7 +828,7 @@ const app=createApp({
   }
   function makeSlRow(x,extra){
     return Object.assign({
-      accountId:null,name:'-',site:'',siteLabel:'',uid:'',uidMasked:'',
+      accountId:null,name:'-',site:'',siteLabel:'',uidMasked:'',
       loginId:'',authUrl:'',status:'waiting',message:'等待浏览器授权…',uidMatched:null,actualName:'',verifiable:true,
       remain:Number((x&&x.expires_in)||600),
       deadline:Date.now()+Number((x&&x.expires_in)||600)*1000,
@@ -841,7 +841,7 @@ const app=createApp({
       const r=await api.post('/admin/accounts/seamless-login/start-pending',{},p.token);
       const rows=(r.pending||[]).map(x=>makeSlRow(x,{
         accountId:x.id,name:x.name||x.uid_masked||'-',site:x.site,siteLabel:siteLabelOf(x.site),
-        uid:x.uid,uidMasked:x.uid_masked,verifiable:x.verifiable!==false,loginId:x.login_id,authUrl:x.auth_url,
+        uidMasked:x.uid_masked,verifiable:x.verifiable!==false,loginId:x.login_id,authUrl:x.auth_url,
         status:x.error?'failed':'waiting',message:x.error||'等待浏览器授权…',
       }));
       sl.value={status:'ready',rows,allActive:!!r.all_active,message:rows.length?'':'所有账号都已激活，无需登录'};
@@ -885,7 +885,9 @@ const app=createApp({
     }catch(e){p.toast(apiErr(e,'发起失败'),'err')}finally{slBusy.value=false}
   }
   function closeSeamless(){stopSeamless();sl.value=null}
-  function slSafeUrl(u){const t=String(u||'');return /^https:\/\/www\.(workbuddy|codebuddy)\.(cn|ai)\//.test(t)?t:''}
+  // 授权链接的来源已由后端 _safe_auth_url 校验；这里只做一层防御，别把带空白的
+  // 字符串当 URL 用（href 与 clipboard 都走它）。
+  function slSafeUrl(u){return String(u||'').trim()}
   function copySlUrl(row){const u=slSafeUrl(row&&row.authUrl);if(!u){p.toast('授权链接无效，请重新发起','err');return}navigator.clipboard.writeText(u);p.toast('授权链接已复制','info')}
   function hydrate(a){return {...a,_weight:a.weight||1,_priority:a.priority||0,_creditSnapshot:a.credit_snapshot||a.credit_limit||0,_baseWeight:a.weight||1,_basePriority:a.priority||0,_baseCreditSnapshot:a.credit_snapshot||a.credit_limit||0}}
   function dirty(a){return Number(a._weight||1)!==Number(a._baseWeight||1)||Number(a._priority||0)!==Number(a._basePriority||0)||Number(a._creditSnapshot||0)!==Number(a._baseCreditSnapshot||0)}

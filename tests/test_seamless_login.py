@@ -289,8 +289,9 @@ def test_pending_accounts_lists_only_non_active_with_site():
     assert [r["name"] for r in rows] == ["expired-intl"]
     assert rows[0]["site"] == "international"
     assert rows[0]["platform"] == "workbuddy-ai"
-    assert rows[0]["uid"] == intl_uid
+    assert "uid" not in rows[0], "明文 uid 不出后端，只给掩码"
     assert rows[0]["uid_masked"] == "83271b…15f4", "uid 要脱敏后再给界面"
+    assert rows[0]["verifiable"] is True, "有 uid 才能做授权后核对"
 
 
 def test_start_for_pending_returns_link_per_account(monkeypatch):
@@ -398,7 +399,22 @@ def test_pending_account_without_uid_is_flagged_unverifiable():
                     "domain": "www.workbuddy.cn", "access_token": "t"})
     rows = [r for r in sl.pending_accounts() if r["name"] == "no-uid"]
     assert rows and rows[0]["verifiable"] is False
-    assert rows[0]["uid"] == ""
+    assert "uid" not in rows[0], "明文 uid 不必外发，界面只用掩码与 verifiable"
+
+
+def test_start_for_pending_verifies_against_the_accounts_real_uid(monkeypatch):
+    """expect_uid 按账号 id 现取：uid 不再随 pending 列表外发，核对依然要对得上。"""
+    monkeypatch.setattr(sl, "_http_json", _fake_http(
+        [{"code": 0, "data": {"state": "st-1", "authUrl": "https://www.workbuddy.ai/login"}}] * 2
+    ))
+    db.add_account({"name": "expired-intl", "uid": "uid-real-intl", "status": "expired",
+                    "domain": "www.workbuddy.ai", "access_token": "t"})
+
+    out = sl.start_for_pending()
+    row = next(r for r in out["pending"] if r["name"] == "expired-intl")
+    assert "uid" not in row, "明文 uid 不出后端"
+    assert row["site"] == sl.sites.SITE_INTERNATIONAL
+    assert sl._flows[row["login_id"]]["expect_uid"] == "uid-real-intl"
 
 
 def test_write_credentials_refuses_empty_uid():

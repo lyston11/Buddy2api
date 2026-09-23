@@ -251,12 +251,21 @@ def pending_accounts() -> list[dict]:
             "site": group,
             "api_host": SITE_ENDPOINTS[group][0],
             "platform": SITE_ENDPOINTS[group][1],
-            "uid": uid,
+            # 只给掩码：明文 uid 没必要离开后端（前端只用它显示"无 uid"提示），
+            # 真正的 uid 在 start_for_pending 里按账号 id 现取，用于授权后核对。
             "uid_masked": _mask_uid(uid),
             # 没有 uid 就无法在授权后核对身份，界面要如实说明（不能假装已核对）
             "verifiable": bool(uid),
         })
     return out
+
+
+def _uid_for_account_id(account_id) -> str:
+    """按账号 id 取 uid（发起授权时用，不外发）。"""
+    for account in db.list_accounts(provider="workbuddy"):
+        if account.get("id") == account_id:
+            return str(account.get("uid") or "")
+    return ""
 
 
 def start_for_pending() -> dict:
@@ -270,7 +279,7 @@ def start_for_pending() -> dict:
     flows = []
     for item in pending:
         try:
-            started = start(site=item["site"], expect_uid=item["uid"])
+            started = start(site=item["site"], expect_uid=_uid_for_account_id(item["id"]))
         except SeamlessLoginError as exc:
             flows.append({**item, "error": str(exc)[:200]})
             continue
@@ -339,7 +348,6 @@ def _write_credentials(uid: str, token_data: dict, account: dict, site: str = DE
         "account_type": str(account.get("type") or "personal"),
         "access_token": access,
         "refresh_token": refresh,
-        "domain": domain,
         "domain": domain,
         "enterprise_id": str(account.get("enterpriseId") or ""),
     }
