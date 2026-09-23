@@ -148,6 +148,53 @@ The database migrates on startup. Existing keys stay on `workbuddy`. Startup no 
 
 Unprefixed `auto` follows the key’s channel. Use a separate key per channel. On the Models page, “一键读取供应模型” refreshes each channel’s supplier list separately; a TraeWork-only id such as Doubao is never merged into WorkBuddy.
 
+### Using it from DSH (DeepSeek Harness)
+
+DSH talks to the gateway over the OpenAI-compatible API:
+
+```
+DSH ──(openai-completions, Bearer sk-cb-…)──▶ buddy2api 127.0.0.1:8787/v1 ──▶ WorkBuddy upstream
+```
+
+Prerequisites (all in the admin UI): the gateway is running, the Accounts page has at least one **active** account (import a local login, or re-authorize an `expired` one in the browser), and an API key exists for the `workbuddy` channel.
+
+1. Put the key in `~/.dsh/.credentials.yaml` under `refs:` — DSH providers reference it by env-var name:
+
+```yaml
+refs:
+  BUDDY2API_KEY: sk-cb-your-key
+```
+
+2. Add the provider to **both** `~/.dsh/profiles/web/cordis.patch.yml` and `~/.dsh/profiles/headless/cordis.patch.yml` (otherwise the model is missing in the other profile):
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      workbuddy:
+        apiKeyEnv: BUDDY2API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8787/v1
+        models:
+          - id: deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash (WorkBuddy)
+            input: [text, image]
+            contextWindow: 1000000
+            maxTokens: 65536
+```
+
+`id` is a gateway model name — `auto` is the simplest, or a concrete id such as `deepseek-v4.1-flash`. Full list: `/v1/models` or the Models page.
+
+3. Verify:
+
+```bash
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer sk-cb-your-key" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":20}'
+```
+
+**Pinning a model to one account.** Register a model alias on the Models page (e.g. `deepseek-v4.1-flash@acc-a` → `deepseek-v4.1-flash`), create a key whose `default_account` is that account, and give the alias its own DSH provider using that key. The alias only makes the entry selectable — **the key’s `default_account` is what actually pins the account**; calling an `@alias` with an unpinned key still load-balances across accounts.
+
 ### Model capacity discovery
 
 Refreshing supplier models now retains upstream input/output capacities. `/v1/models` exposes `context_window` and `max_output_tokens`; WorkBuddy's `maxInputTokens` and `maxOutputTokens` map to these fields, rather than treating its desktop `contextWindow.defaultLength` as the maximum.

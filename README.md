@@ -12,6 +12,13 @@
 
 Buddy2api 在本机提供 `http://127.0.0.1:8787/v1`。你在官方客户端里登录并且还有额度，这个网关把本机登录导入进来，把请求转到对应厂商。普通客户端走 Chat Completions；Codex 走 `/v1/responses`，管理页把 Key 类型选成 Codex 时会做一轮内容清洗。
 
+**只想把 WorkBuddy 反代给 DSH（DeepSeek Harness）用**，按这条最短路径走：
+
+1. 启动网关 → 打开 `http://127.0.0.1:8787/`；
+2. 「账号」页导入本机 WorkBuddy 登录（没登录过、或账号显示 `expired` 时，点「无感登录」用浏览器授权即可，不必重装客户端）；
+3. 「API Keys」页建一把通道为 `workbuddy` 的 Key；
+4. 按 [接入 DSH](#接入-dshdeepseek-harness) 把 Key 与 provider 填进 `~/.dsh`。
+
 四个通道默认都开。没装、没登录的通道，账号页检测为空，不会自动入库。
 
 ```powershell
@@ -221,6 +228,105 @@ python -m buddy2api
 | Stream | 建议开 |
 
 接口：`/v1/chat/completions`、`/v1/responses`、`/v1/models`。没加前缀的 `auto` 走这把 Key 绑定的通道。Codex 用 Responses 接口；管理页选 Codex 类型的 Key 会按 Codex 特征 prompt 做清洗（其它客户端借用这把 Key、但没有 Codex 特征时不改写）。
+
+### 接入 DSH（DeepSeek Harness）
+
+DSH 通过 OpenAI 兼容协议接进来，整条链路是：
+
+```
+DSH ──(openai-completions, Bearer sk-cb-…)──▶ buddy2api 127.0.0.1:8787/v1 ──▶ WorkBuddy 上游
+```
+
+**前置条件**（都在管理页完成，见上文「第一次打开网页之后」）：
+
+1. 网关已启动，`http://127.0.0.1:8787/` 能打开；
+2. 「账号」页里有 **active** 账号 —— 一键导入本机登录，或账号失效时点「无感登录」用浏览器重新授权；
+3. 「API Keys」页创建一把 Key（通道选 `workbuddy`），复制 `sk-cb-…`。
+
+#### 1. 把 Key 写进 DSH 凭证
+
+DSH 的 provider 用**环境变量名**引用密钥，密钥本身放在 `~/.dsh/.credentials.yaml` 的 `refs:` 下：
+
+```yaml
+refs:
+  BUDDY2API_KEY: sk-cb-你的Key
+```
+
+#### 2. 在两个 profile 里加 provider
+
+`~/.dsh/profiles/web/cordis.patch.yml` **和** `~/.dsh/profiles/headless/cordis.patch.yml` 都要改（只改一个的话，另一个 profile 里选不到这个模型）：
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      workbuddy:
+        apiKeyEnv: BUDDY2API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8787/v1
+        models:
+          - id: deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash (WorkBuddy)
+            input: [text, image]
+            contextWindow: 1000000
+            maxTokens: 65536
+            reasoningEfforts:
+              off:
+              low: low
+              high: high
+              max: max
+```
+
+- `id` 填网关的模型名：`auto` 最省事（跟着 Key 绑定的通道自动选），也可填具体模型（如 `deepseek-v4.1-flash`、`glm-5.2`），模型清单见 `/v1/models` 或管理页「模型配置」；
+- `contextWindow` / `maxTokens` 是**给 DSH 看的上下文与输出预算**，按需调整；网关侧的容量以「一键读取供应模型」抓到的为准；
+- `reasoningEfforts` 对应网关的思考档位（`none`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`），只对支持档位的模型有意义。
+
+#### 3. 验证
+
+```bash
+# 网关本身通不通（把 sk-cb-… 换成你的 Key）
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer sk-cb-你的Key" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"回复 ok"}],"max_tokens":20}'
+```
+
+返回 `choices` 就说明整条链路通了。DSH 里则直接选到上面配的 `name` 发一句话即可。
+
+#### 想固定用某个账号？用「别名 + 绑定 Key」
+
+网关的调度默认在可用账号间自动负载均衡。若要把某类请求固定到某个账号（不同账号在不同站点的计费/额度不同），做法是**两件配套的事**：
+
+1. 「API Keys」创建一把 Key 并把 `default_account` 指到目标账号 —— 这是真正决定用哪个账号的地方；
+2. 「模型配置 → 模型别名」注册一个别名（如 `deepseek-v4.1-flash@acc-a` → `deepseek-v4.1-flash`），再在 DSH 里为这个别名单独配一个 provider，用第 1 步那把 Key。
+
+```yaml
+      wb-acc-a:
+        apiKeyEnv: WB_KEY_ACC_A        # .credentials.yaml 里对应这把绑定 Key
+        api: openai-completions
+        baseURL: http://127.0.0.1:8787/v1
+        models:
+          - id: deepseek-v4.1-flash@acc-a   # 网关侧注册过的别名
+            name: DeepSeek V4.1 Flash · acc-a
+```
+
+⚠️ **别名本身不绑定账号**。别名只负责"在 DSH 的模型选择里能单独列出来"，真正决定账号的是 Key 的 `default_account`。**用通用 Key 调 `@acc-a` 别名，请求不会落到 acc-a** —— 会照常走负载均衡。所以别名必须和绑定 Key 配套使用。
+
+作为对照，两者配套时的实测落点（`logs.account_name`）：
+
+| 模型 | Key | 实际落点 |
+|---|---|---|
+| `deepseek-v4.1-flash@acc-a` | 通用 Key（未绑账号） | 由负载均衡决定，**不保证**是 acc-a |
+| `deepseek-v4.1-flash@acc-a` | 绑定到 acc-a 的 Key | acc-a ✅ |
+
+#### 常见问题
+
+| 现象 | 原因与处理 |
+|---|---|
+| DSH 报模型不存在 / 401 | Key 没写进 `.credentials.yaml` 的 `refs:`，或 `apiKeyEnv` 名字对不上，或 Key 不是 `workbuddy` 通道 |
+| 只改了 `web` profile，headless 里没有 | 两个 profile 的 `cordis.patch.yml` 都要加 provider |
+| 请求都打到一个账号上 | 该账号是某个绑定 Key 的 `default_account`，或它被标记为只服务显式绑定（账号页的「凭据来源」列能看到）；国际站/国内站是两套账号，路由按模型与站点选择 |
+| 某个模型国际上免费、国内收费 | 两个站点是两套账号与计费，路由会按模型的站点偏好选择；国际账号失效时可能回落到收费的国内站，注意额度消耗（「Dashboard」的模型占比可按账号下钻）|
+| 账号突然 `expired` | 上游把 refresh token 判失效（常见于客户端换号登录）。账号页点「无感登录」用浏览器重新授权即可，不用重装 |
 
 ### 模型容量与自动发现
 
