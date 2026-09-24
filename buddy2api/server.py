@@ -29,7 +29,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTMLResponse
 from starlette.concurrency import run_in_threadpool
 
 import buddy2api.database as db
@@ -117,6 +117,9 @@ app.add_middleware(
 )
 
 WEB_DIR = PROJECT_ROOT / "web"
+VENDOR_DIR = WEB_DIR / "vendor"
+# Web UI 的外链脚本改为本地托管，避免外网 CDN 不可达时整页白屏（Vue 未定义）
+VENDOR_ASSETS = {"vue.global.prod.js": "https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.min.js"}
 
 
 # ============================================================
@@ -1454,6 +1457,8 @@ async def admin_update_site_preference(
 def _render_index_html() -> str:
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     html = html.replace("/* LOCAL_MODE */ false", "true" if LOCAL_MODE else "false")
+    for local, remote in VENDOR_ASSETS.items():
+        html = html.replace(remote, f"/vendor/{local}")
     return html.replace("__APP_VERSION__", VERSION)
 
 
@@ -1464,6 +1469,20 @@ async def index(request: Request):
         headers={"Cache-Control": "no-store", "Content-Security-Policy": "frame-ancestors 'none'"},
     )
     return response
+
+
+@app.get("/vendor/{filename}")
+async def vendor_asset(filename: str):
+    if filename not in VENDOR_ASSETS:
+        raise HTTPException(status_code=404, detail="not found")
+    path = VENDOR_DIR / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(
+        path,
+        media_type="application/javascript; charset=utf-8",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 # ============================================================

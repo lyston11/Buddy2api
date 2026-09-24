@@ -417,7 +417,7 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
 <div id="app"></div>
 <script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.min.js"></script>
 <script>
-// 致命错误兜底：Vue 由 CDN 提供，若加载失败或初始化抛错，整页会白屏且没有任何提示。
+// 致命错误兜底：Vue 由本地 /vendor 提供（见 server.py VENDOR_ASSETS），若加载失败或初始化抛错，整页会白屏且没有任何提示。
 // 先把"把错误显示到页面上"的能力装到 window，后续任何未捕获错误都能看见。
 (function(){
   function show(msg){
@@ -439,7 +439,7 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
   window.addEventListener("error",function(e){
     var t=e&&e.target;
     if(t&&t!==window&&t.tagName){
-      if(t.tagName==="SCRIPT")show("脚本加载失败（检查网络或 CDN 可达性）: "+(t.src||"unknown"));
+      if(t.tagName==="SCRIPT")show("脚本加载失败（检查 /vendor 静态资源是否可访问）: "+(t.src||"unknown"));
       return;
     }
     show("未捕获错误: "+((e&&e.message)||"unknown"));

@@ -15,10 +15,14 @@
 覆盖范围：{{ 插值 }}、v-* 指令、:bind 指令、@event 处理器。
 """
 
+import asyncio
 import re
 from pathlib import Path
 
+import httpx
 import pytest
+
+import buddy2api.server as server
 
 INDEX_HTML = Path(__file__).resolve().parents[1] / "web" / "index.html"
 
@@ -154,6 +158,49 @@ def test_accounts_component_exposes_site_label(html_source):
             break
     else:
         pytest.fail("没有找到渲染 siteLabel 的组件")
+
+
+def test_vue_is_served_locally_not_from_cdn(html_source):
+    """Vue 必须由本机 /vendor 提供，不能再依赖外网 CDN。
+
+    回归（2026-09-24）：index.html 一直外链 jsdelivr 上的 Vue。当代理到该 CDN 不通时
+    浏览器拿不到脚本 → `Uncaught ReferenceError: Vue is not defined` → Vue 从不 mount
+    → 整页白屏，而 HTTP 响应仍是 200、字节数也正常，看响应完全查不出来。
+
+    这里钉死整条链路：模板的外链 URL 有对应的本地文件、渲染后换成 /vendor 路径、
+    静态资源真的能取到、未知文件仍是 404。
+    """
+    # 1. 模板里每个外链脚本 URL 都必须在服务端的本地映射表里（否则渲染后仍是外链）
+    linked = re.findall(r'<script[^>]*\bsrc="(https?://[^"]+)"', html_source)
+    assert linked, "index.html 里没有外链脚本，测试已失效"
+    for url in linked:
+        assert url in server.VENDOR_ASSETS.values(), f"外链脚本 {url} 没有本地副本，CDN 不可达时仍会白屏"
+
+    # 2. 渲染后的 HTML 只引用本地 /vendor 路径
+    rendered = server._render_index_html()
+    for local, remote in server.VENDOR_ASSETS.items():
+        assert f'src="/vendor/{local}"' in rendered, f"渲染后应引用 /vendor/{local}"
+        assert remote not in rendered, f"渲染后不应再出现外链 {remote}"
+
+    # 3. 本地副本存在，且真的能通过 HTTP 取到
+    def get(path):
+        async def run():
+            transport = httpx.ASGITransport(app=server.app, client=("127.0.0.1", 12345))
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8787") as client:
+                return await client.get(path)
+        return asyncio.run(run())
+
+    for local in server.VENDOR_ASSETS:
+        assert (server.VENDOR_DIR / local).is_file(), f"缺少本地脚本 web/vendor/{local}"
+        response = get(f"/vendor/{local}")
+        assert response.status_code == 200
+        assert "javascript" in response.headers["content-type"]
+        # Vue 的全局构建会把 Vue 挂到 window 上，用这个当"确实是 Vue"的判据
+        assert "Vue" in response.text
+
+    # 4. 白名单之外的文件不能被当成静态资源取走
+    assert get("/vendor/../server.py").status_code in (404, 400)
+    assert get("/vendor/nope.js").status_code == 404
 
 
 def test_ui_has_global_error_handler(html_source):
