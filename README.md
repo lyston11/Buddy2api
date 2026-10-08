@@ -325,6 +325,7 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_GATEWAY_PROVIDERS` | 启用哪些通道，逗号分隔。默认 `workbuddy,qclaw,qwenwork,traework`。只想留一家时再改 |
 | `CB_GATEWAY_AUTO_IMPORT` | 设 `1` 则启动时自动导入。默认 `0` |
 | `CB_GATEWAY_CHECKIN_GAP_MS` | 一键领取间隔，默认 `800` |
+| `CB_GATEWAY_MAX_BODY_BYTES` | 请求体上限，默认 `67108864`（64 MiB）。多图请求（图片以 base64 内联）很容易超过 10 MiB，嫌小就调大；超限返回 `413 Request body is too large` |
 | `CB_GATEWAY_ROUTE_WINDOW_SECONDS` | 选路负载统计窗口，默认 `900`（15 分钟）。窗口内服务请求少的账号先用 |
 | `CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS` | 账号被上游限额（429）后在该模型上的冷却时长，默认 `900`。按「账号 × 模型」记，不影响该账号服务其它模型 |
 | `CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS` | 一次请求最多换几个账号重试，默认 `8`。必须大于账号数，否则健康账号可能轮不到 |

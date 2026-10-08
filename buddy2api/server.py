@@ -130,7 +130,8 @@ ADMIN_TOKEN: str = ""
 ALLOW_NO_ADMIN_AUTH = False
 LOCAL_MODE = False
 ALLOW_UNAUTHENTICATED_API = _env_flag("CB_GATEWAY_ALLOW_UNAUTHENTICATED_API", False)
-MAX_BODY_BYTES = max(1024, _env_int("CB_GATEWAY_MAX_BODY_BYTES", 10 * 1024 * 1024))
+# 默认 64 MiB：多图请求（base64 内联）很容易超过 10 MiB
+MAX_BODY_BYTES = max(1024, _env_int("CB_GATEWAY_MAX_BODY_BYTES", 64 * 1024 * 1024))
 _CURRENT_REQUEST: contextvars.ContextVar[Request | None] = contextvars.ContextVar("current_request", default=None)
 
 
