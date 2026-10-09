@@ -7,10 +7,19 @@ Legacy flat `model_aliases` settings are treated as WorkBuddy-only.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 
 import buddy2api.database as db
 
 SETTING = "model_aliases"
+
+# 别名表带 TTL 缓存：`resolve` 在请求路径上（proxy 归一 model、路由归一限流键）会被
+# 每次请求调到，每次都开连接读 settings 是白花。改配置只有管理页这一个入口，
+# `save_user_aliases` 会立刻失效缓存，所以 TTL 只用来兑外部直改 DB 的情况。
+_ALIAS_CACHE_LOCK = threading.Lock()
+_ALIAS_CACHE: tuple[float, dict[str, dict[str, str]]] = (0.0, {})
+ALIAS_CACHE_TTL = 30.0
 
 
 class AliasError(ValueError):
@@ -53,6 +62,26 @@ def _clean_map(raw) -> dict[str, str]:
 
 
 def load_user_aliases() -> dict[str, dict[str, str]]:
+    global _ALIAS_CACHE
+    now = time.monotonic()
+    with _ALIAS_CACHE_LOCK:
+        stamp, cached = _ALIAS_CACHE
+        if cached and now - stamp < ALIAS_CACHE_TTL:
+            return cached
+    loaded = _load_user_aliases_uncached()
+    with _ALIAS_CACHE_LOCK:
+        _ALIAS_CACHE = (now, loaded)
+    return loaded
+
+
+def forget_alias_cache() -> None:
+    """清掉别名缓存（保存别名、测试、手工调参用）。"""
+    global _ALIAS_CACHE
+    with _ALIAS_CACHE_LOCK:
+        _ALIAS_CACHE = (0.0, {})
+
+
+def _load_user_aliases_uncached() -> dict[str, dict[str, str]]:
     try:
         raw = db.get_setting(SETTING, {}) or {}
     except sqlite3.OperationalError:
@@ -148,6 +177,8 @@ def save_user_aliases(data: dict) -> dict[str, dict[str, str]]:
             clean[alias] = target
         stored[name] = clean
     db.set_setting(SETTING, stored)
+    # 保存即失效：管理页点「保存别名」后必须马上生效，不能等 TTL。
+    forget_alias_cache()
     return stored
 
 

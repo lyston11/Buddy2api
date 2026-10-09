@@ -209,9 +209,52 @@ def test_recording_supplier_models_prunes_stale_denials():
     aid = _make_account("a", "www.workbuddy.ai")
     auth_manager.mark_model_denied(aid, "gone")
     auth_manager.record_account_models(aid, ["kept"])
-    # 新列表里没有的模型不可能再被选中，记录顺手清掉
-    assert auth_manager.account_supports_model(aid, "gone") is False
+    # 新列表里有它，说明之前那次拒绝是瞬时/可恢复的，拒绝记录顺手清掉，让它重新可被选中
+    assert auth_manager.account_supports_model(aid, "gone") is True
     assert auth_manager.account_supports_model(aid, "kept") is True
+
+
+def test_unlisted_model_is_not_hard_excluded():
+    """供应商清单是「推荐清单」不是能力边界：清单里没有的模型仍必须可被选中。
+
+    回归点（2026-10-10）：清单被当硬能力用，导致 deepseek-v4.1-flash 在国际站
+    实测 43173 次成功且全部免费，却因为不在国际账号清单里而被摘掉全部 6 个免费
+    账号，请求被赶到国内站按每次 0.23 付费。
+    """
+    listed = _make_account("listed", "www.workbuddy.ai")
+    unlisted = _make_account("unlisted", "www.workbuddy.ai")
+    auth_manager.record_account_models(listed, ["m"])
+    auth_manager.record_account_models(unlisted, ["other"])
+
+    # 清单里没有不等于服务不了 —— 上游没拒绝过就仍然可选
+    assert auth_manager.account_supports_model(unlisted, "m") is True
+    assert auth_manager.account_lists_model(unlisted, "m") is False
+    assert auth_manager.account_lists_model(listed, "m") is True
+
+    # 但清单只调优先级：只在自己被拒过之后才真的落选
+    picks = {auth_manager.pick_account(model="m")["id"] for _ in range(8)}
+    assert picks == {listed}, picks
+
+    auth_manager.mark_model_denied(listed, "m")
+    for _ in range(8):
+        assert auth_manager.pick_account(model="m")["id"] == unlisted
+
+
+def test_site_preference_outranks_supplier_list():
+    """站点偏好（哪边免费/更便宜）必须先于清单命中，否则会白花钱。
+
+    回归点（2026-10-10）：deepseek-v4.1-flash 国际站免费（43173 次 0 扣费）但不在
+    国际账号清单里、国内站收费（均价 0.23）却在国内清单里。若按清单优先，会把
+    请求从免费的国际站拽到收费的国内站。
+    """
+    intl = _make_account("intl", "www.workbuddy.ai")
+    cn = _make_account("cn", "www.workbuddy.cn")
+    auth_manager.record_account_models(intl, ["something-else"])
+    auth_manager.record_account_models(cn, ["ds"])
+    db.set_setting("model_site_preference", {"default": "", "models": {"ds": "international"}})
+
+    for _ in range(8):
+        assert auth_manager.pick_account(model="ds")["id"] == intl
 
 
 def test_forget_account_clears_route_state():
@@ -483,9 +526,13 @@ def test_catalog_samples_every_account_and_records_capability(monkeypatch):
     assert {"auto", "deepseek-v4.1-flash", "default-model", "gpt-5.6-sol"} <= ids
 
     assert auth_manager.account_supports_model(intl, "gpt-5.6-sol") is True
-    assert auth_manager.account_supports_model(intl, "auto") is False
+    # 清单里没有的模型不再硬排除（它只是推荐清单）；但清单命中仍然优先
+    assert auth_manager.account_supports_model(intl, "auto") is True
+    assert auth_manager.account_lists_model(intl, "auto") is False
+    assert auth_manager.account_lists_model(intl, "gpt-5.6-sol") is True
     assert auth_manager.account_supports_model(cn, "auto") is True
-    assert auth_manager.account_supports_model(cn, "gpt-5.6-sol") is False
+    assert auth_manager.account_supports_model(cn, "gpt-5.6-sol") is True
+    assert auth_manager.account_lists_model(cn, "gpt-5.6-sol") is False
 
 
 def test_catalog_ignores_disabled_accounts(monkeypatch):

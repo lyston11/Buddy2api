@@ -364,7 +364,23 @@ def mark_account_success(aid: int, model: Optional[str] = None):
 
 
 def _normalize_route_model(model) -> str:
-    return str(model or "").strip()
+    """路由用的模型键。
+
+    先做别名归一，让「同一个物理模型的多个入口名」共享限流冷却与拒绝记录。
+    实测两个站点的后端 ID 不同名（国际 `kimi-k3`、国内 `kimi-k3-1`），若按原始名
+    记冷却，在 A 名上被 429 之后换 B 名重试会绕开自己的冷却，反复撞同一个限额账号。
+    归一只影响路由状态，不改客户端请求里的 model。
+    """
+    value = str(model or "").strip()
+    if not value:
+        return value
+    try:
+        import buddy2api.aliases as aliases
+
+        return aliases.resolve("workbuddy", value)
+    except Exception:
+        # 别名表读不出来（DB 异常）不能让选路崩：退回原始名。
+        return value
 
 
 def clear_model_rate_limit(aid: int, model) -> None:
@@ -1567,10 +1583,21 @@ async def claim_daily_checkin(account: dict) -> dict:
 # 国内账号，上游回 400（模型不存在 / 未授权），而 400 不在换号重试的集合里，客户端
 # 直接看到报错。
 #
-# 这里记住两件事：
-#   _account_models  —— 供应商模型列表说这个账号能服务哪些模型（主动能力）
-#   _account_denied  —— 实测被上游明确拒绝过的模型（被动纠正，能覆盖列表不准的情况）
-# 两者取交集的反面：被拒过 → 不能；已知列表里没有 → 不能；其余未知 → 先试，错了再记。
+# 这里记住两件事，但两者权重完全不同：
+#   _account_models  —— 供应商模型列表说这个账号「推荐」服务哪些模型（只作优先级参考）
+#   _account_denied  —— 实测被上游明确拒绝过的模型（真正的能力边界，硬过滤）
+# 被拒过 → 一定不能；清单里有 → 优先用；清单里没有但没被拒过 → 仍然先试。
+#
+# 为什么清单不能当硬能力用（2026-10-10 修）：它只是官方**推荐清单**，不等于实际可服务
+# 范围。实测 deepseek-v4.1-flash 在国际站 43173 次成功且全部免费，而国际账号的清单里
+# 根本没有它 —— 当硬能力用会把这 6 个免费账号全部摘掉，把请求赶到国内站按每次 0.23
+# 付费，正违反「能白嫖就不消耗积分」。同理国内账号清单只列 kimi-k3-1，而国内后端对
+# kimi-k3 与 kimi-k3-1 都返回 200，硬过滤会让 kimi-k3 完全用不到国内的账号。
+#
+# 原注释担心的「400 不在换号重试集合里，客户端直接看到报错」已经不成立：
+# `proxy._model_unavailable_error` 现在把 400+11102「model [...] service info not found」
+# 判为可换号，并由 `mark_model_denied` 记下来，下一次就不再选中它 ——
+# 由上游自愈比按一份不准的清单猜准得多。
 _model_capability_lock = threading.Lock()
 _account_models: dict[int, frozenset[str]] = {}
 _account_denied: dict[int, set[str]] = {}
@@ -1600,18 +1627,34 @@ def mark_model_denied(aid: int, model: str) -> None:
         _account_denied.setdefault(aid, set()).add(mid)
 
 
-def account_supports_model(aid: int, model: str) -> bool:
-    """账号能否服务该模型。能力未知时返回 True（先试，由 400 自愈）。"""
+def account_lists_model(aid: int, model: str) -> bool:
+    """供应商清单里是否列了这个模型。
+
+    只作优先级参考，**绝不用来排除候选**：清单是官方推荐清单，漏报是常态。
+    清单未知时返回 True（不凭未知降级别人）。
+    """
     mid = str(model or "").strip()
     if not mid:
         return True
     with _model_capability_lock:
-        if mid in _account_denied.get(aid, ()):
-            return False
         known = _account_models.get(aid)
-    if known is not None and mid not in known:
-        return False
-    return True
+    if known is None:
+        return True
+    return mid in known
+
+
+def account_supports_model(aid: int, model: str) -> bool:
+    """账号能否服务该模型：只有被上游实测拒绝过才算不能。
+
+    清单里没有的模型仍然返回 True —— 清单只是推荐清单，实测漏报很常见
+    （见 `_account_models` 上方注释）。真不支持的模型由上游 400 判出来，
+    经 `mark_model_denied` 记下来后这里才会返回 False。
+    """
+    mid = str(model or "").strip()
+    if not mid:
+        return True
+    with _model_capability_lock:
+        return mid not in _account_denied.get(aid, ())
 
 
 def forget_account(aid: int) -> None:
@@ -1846,10 +1889,17 @@ def pick_account(
 
     过滤分两类，绝不能混为一谈：
       - 硬过滤（排除候选）：调用方显式排除、账号正在冷却、账号被隔离、
-        **该账号在该模型上正在限流冷却**。这些情况下选它只会重演同一次失败。
-      - 软过滤（只调优先级）：能力未知、站点偏好。
+        **该账号在该模型上正在限流冷却**、**该账号在这个模型上被上游实测拒绝过**。
+        这些情况下选它只会重演同一次失败。
+      - 软过滤（只调优先级）：站点偏好、供应商清单命中。前两者只把比较范围收窄，
+        收窄后为空就退回全量候选，不会让请求报「无可用账号」。
     限流冷却属于前者，且必须参与候选计算：否则请求会反复选中同一个正在被限流的
     账号、把换号重试的次数耗尽，而真正健康的账号从头到尾没被试过。
+
+    顺序也是硬约束，不可颠倒：
+      站点偏好（哪边免费/更便宜）→ 供应商清单（哪边官方推荐）→ 到期紧急度 → 负载。
+    站点偏好必须先于清单，否则请求会被拽回收费站点白花钱（清单是官方推荐清单、
+    漏报常态，见 `_account_models` 上方注释）。
 
     最后：API Key 若绑定了账号（default_account>0），只返回那个账号。绑定优先于所有
     调度规则 —— 它存在的意义就是让调用方指定用哪个账号。
@@ -1875,8 +1925,10 @@ def pick_account(
         not_limited = [a for a in candidates if not account_model_rate_limited(a["id"], model)]
         if not_limited:
             candidates = not_limited
+        # 只用「被上游实测拒绝过」做硬过滤；清单命中留给下面的软过滤，
+        # 因为清单只是推荐清单、漏报是常态。
         capable = [a for a in candidates if account_supports_model(a["id"], model)]
-        # 已知全都不支持时保留原候选：让上游来判，顺便把结论学回来
+        # 全都被拒过时保留原候选：让上游再判一次，也给我们机会把结论刷新回来
         if capable:
             candidates = capable
 
@@ -1887,6 +1939,16 @@ def pick_account(
         on_preferred = [a for a in candidates if sites.site_group(a.get("domain")) == preferred]
         if on_preferred:
             candidates = on_preferred
+
+    # 供应商清单同样只调优先级、不排除账号。位置刻意在站点偏好**之后**：
+    # 站点偏好表达的是「哪边免费/更便宜」，而清单只是「哪边官方推荐」；
+    # 若清单优先，请求会被拽回收费站点，白花钱。
+    # 实测：deepseek-v4.1-flash 国际站免费但不在国际账号清单里，
+    # 先按清单收窄就等于放弃免费的那一侧。
+    if model:
+        listed = [a for a in candidates if account_lists_model(a["id"], model)]
+        if listed:
+            candidates = listed
 
     highest_priority = max(_route_priority(a) for a in candidates)
     top_candidates = [a for a in candidates if _route_priority(a) == highest_priority]
