@@ -470,7 +470,7 @@ def test_model_blocked_400_switches_account_without_blaming_it(monkeypatch):
     async def fake_headers(account):
         return {"Authorization": "Bearer x"}
 
-    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
+    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0, attempts=1):
         seen.append(account["id"])
         if account["id"] == blocked:
             return ("error", (400, {"code": 11102, "msg": "model [m] service info not found"}))

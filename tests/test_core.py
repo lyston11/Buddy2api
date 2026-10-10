@@ -691,7 +691,7 @@ def _install_sequenced_stream_fakes(monkeypatch, streams: list[list[bytes]]) -> 
     用它区分「边收边转发」和「整段收完再吐」：前者在网关吐出第一个正文增量时，
     上游一定还没被读完。
     """
-    calls = {"bodies": [], "consumed": []}
+    calls = {"bodies": [], "consumed": [], "logs": []}
 
     class FakeResponse:
         status_code = 200
@@ -742,7 +742,7 @@ def _install_sequenced_stream_fakes(monkeypatch, streams: list[list[bytes]]) -> 
     monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
-    monkeypatch.setattr(proxy, "_log_request", lambda *_a, **_k: None)
+    monkeypatch.setattr(proxy, "_log_request", lambda *a, **k: calls["logs"].append((a, k)))
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
     return calls
 
@@ -3346,7 +3346,7 @@ def test_non_stream_proxy_fails_over_on_retryable_upstream(isolated_db, monkeypa
     async def delay(_attempt):
         return None
 
-    async def collect(*_args):
+    async def collect(*_args, **_kwargs):
         if len(calls) == 1:
             return ("error", (503, {"error": {"message": "busy"}}))
         return ("json", {"id": "ok", "choices": [], "usage": {"total_tokens": 0}})
@@ -3452,11 +3452,15 @@ def _tool_loop_body():
     }
 
 
-def test_stall_detection_ack_text():
+def test_stall_detection_only_empty_text():
+    """停转只认「上游一个字都没给」：正文非空一律放行，不再猜模型意图。"""
     body = _tool_loop_body()
     assert proxy._request_has_tool_loop(body)
-    assert proxy._looks_like_stall_text("好的，马上继续跑流程。")
-    assert proxy._is_tool_stall(body, "stop", False, "好的，马上继续跑流程。")
+    assert proxy._looks_like_stall_text("")
+    assert proxy._looks_like_stall_text("   \n\t ")
+    assert proxy._is_tool_stall(body, "stop", False, "")
+    assert not proxy._looks_like_stall_text("好的，马上继续跑流程。")
+    assert not proxy._is_tool_stall(body, "stop", False, "好的，马上继续跑流程。")
 
 
 @pytest.mark.parametrize("terminal,done,valid", [(None, False, False), (None, True, False), ("stop", False, True), ("stop", True, True), ("length", False, True)])
@@ -3493,13 +3497,12 @@ def test_nonstream_collection_validates_completion(monkeypatch, isolated_db, ter
 
 
 def test_stall_detection_ignores_short_acks():
-    """短回复不等于停转：单纯确认语、短英文回答都放行，只有明确的继续话术才判停转。"""
+    """回归：任何非空正文都不判停转 —— 旧判据把这些（含「我这就去办」）全判成停转。"""
     body = _tool_loop_body()
-    assert not proxy._looks_like_stall_text("OK.")
-    assert not proxy._looks_like_stall_text("Got it, continuing.")
-    assert not proxy._is_tool_stall(body, "stop", False, "Let me write it.")
-    assert not proxy._looks_like_stall_text("In summary, the three files are done.")
-    assert proxy._looks_like_stall_text("I'll continue right away.")
+    for text in ("OK.", "Got it, continuing.", "Let me write it.",
+                 "In summary, the three files are done.", "I'll continue right away."):
+        assert not proxy._looks_like_stall_text(text), text
+        assert not proxy._is_tool_stall(body, "stop", False, text), text
 
 
 def test_stall_detection_rejects_summary():
@@ -3539,7 +3542,7 @@ def test_stall_detection_requires_tool_loop_and_tools():
         "messages": [{"role": "user", "content": "继续。"}],
     }
     assert not proxy._request_has_tool_loop(no_tool_history)
-    assert not proxy._is_tool_stall(no_tool_history, "stop", False, "好的，马上继续。")
+    assert not proxy._is_tool_stall(no_tool_history, "stop", False, "")
     no_tools = {
         "model": "auto",
         "messages": [
@@ -3549,9 +3552,34 @@ def test_stall_detection_requires_tool_loop_and_tools():
             {"role": "user", "content": "继续。"},
         ],
     }
-    assert not proxy._is_tool_stall(no_tools, "stop", False, "好的，马上继续。")
-    assert not proxy._is_tool_stall(_tool_loop_body(), "stop", True, "好的，马上继续。")
-    assert not proxy._is_tool_stall(_tool_loop_body(), "length", False, "好的，马上继续。")
+    assert not proxy._is_tool_stall(no_tools, "stop", False, "")
+    assert not proxy._is_tool_stall(_tool_loop_body(), "stop", True, "")
+    assert not proxy._is_tool_stall(_tool_loop_body(), "length", False, "")
+
+
+def test_plan_retry_separates_account_and_link_failures():
+    """账号级故障用满账号池额度；链路级故障换号换不掉，只给很小的额度。"""
+    max_attempts = 8
+
+    def retries(status, **kwargs):
+        link, count = 0, 0
+        for attempt in range(max_attempts):
+            will, link = proxy._plan_retry(status, attempt, max_attempts, link, **kwargs)
+            if not will:
+                break
+            count += 1
+        return count, link
+
+    # 429：换号就是解法，一直换到额度用尽，且不消耗链路额度
+    assert retries(429) == (max_attempts - 1, 0)
+    # 502：链路级，打满 LINK_LEVEL_MAX_ATTEMPTS 就停，不再白跑剩下的账号
+    link_retries, link_failures = retries(502)
+    assert link_retries == proxy.LINK_LEVEL_MAX_ATTEMPTS - 1
+    assert link_failures == proxy.LINK_LEVEL_MAX_ATTEMPTS
+    # 不可重试的状态码直接停
+    assert proxy._plan_retry(400, 0, max_attempts, 0)[0] is False
+    # 「这个账号服务不了这个模型」换号有效，且不占链路额度
+    assert proxy._plan_retry(400, 0, max_attempts, 9, model_blocked=True) == (True, 9)
 
 
 def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
@@ -3559,7 +3587,8 @@ def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
     stall_json = {
         "id": "c1", "object": "chat.completion", "created": 1,
         "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "好的，马上继续跑流程。"},
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                                                  "reasoning_content": "先想一下怎么做。"},
                      "finish_reason": "stop"}],
         "usage": {},
     }
@@ -3582,7 +3611,7 @@ def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
     async def valid_headers(_account):
         return {"Authorization": "Bearer test"}
 
-    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
+    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0, attempts=1):
         calls.append(body.get("tool_choice"))
         if len(calls) == 1:
             return ("json", stall_json)
@@ -3606,11 +3635,12 @@ def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
 
 
 def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkeypatch, isolated_db):
-    """重试仍无工具调用时，保留首次的文字回复（例如总结类回答）。"""
+    """重试仍无工具调用时，返回第一次的结果（不把重试的文字当成新答案）。"""
     stall_json = {
         "id": "c1", "object": "chat.completion", "created": 1,
         "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "好的，马上继续。"},
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                                                  "reasoning_content": "先想一下怎么做。"},
                      "finish_reason": "stop"}],
         "usage": {},
     }
@@ -3632,7 +3662,7 @@ def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkey
     async def valid_headers(_account):
         return {"Authorization": "Bearer test"}
 
-    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
+    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0, attempts=1):
         calls.append(body.get("tool_choice"))
         if len(calls) == 1:
             return ("json", stall_json)
@@ -3651,16 +3681,12 @@ def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkey
 
     result = asyncio.run(run())
     assert result[0] == "json"
-    assert result[1]["choices"][0]["message"].get("content") == "好的，马上继续。"
+    assert result[1]["id"] == "c1", "重试没给出工具调用时应保留第一次的结果"
     assert calls == [None, "required"]
 
 
-def test_stream_tool_loop_appends_retry_after_stalled_text(monkeypatch, isolated_db):
-    """流式工具回合停转 → 用 tool_choice=required 再补一轮；第一轮正文先补发。
-
-    重打是「追加」不是「替换」：早先会把第一轮整轮丢弃，误判时连模型本来正确的
-    收尾一起扔掉（见 test_stall_detection_accepts_real_short_answers）。
-    """
+def test_stream_tool_loop_retries_empty_stall(monkeypatch, isolated_db):
+    """上游一个字都没给就 stop → 同一账号用 tool_choice=required 再补一轮。"""
     monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
     calls = _install_sequenced_stream_fakes(
         monkeypatch,
@@ -3678,9 +3704,6 @@ def test_stream_tool_loop_appends_retry_after_stalled_text(monkeypatch, isolated
     payloads, done_count = _parse_chat_proxy_sse(raw)
     assert done_count == 1
     assert [sent.get("tool_choice") for sent in calls["bodies"]] == [None, "required"]
-    stalled = "好的，马上继续跑流程。".encode()
-    assert stalled in raw, "第一轮的正文必须补发给客户端，不能丢"
-    assert raw.index(stalled) < raw.index(b'"tool_calls"'), "先补发第一轮正文，再写工具调用"
     # 终止事件只留重打那一轮的（第一轮的 finish_reason=stop 不能漏出去）
     terminal = [
         p for p in payloads if (p.get("choices") or [{}])[0].get("finish_reason")
@@ -3691,6 +3714,26 @@ def test_stream_tool_loop_appends_retry_after_stalled_text(monkeypatch, isolated
         (p.get("choices") or [{}])[0].get("delta", {}).get("tool_calls")
         for p in payloads
     )
+
+
+def test_stream_records_upstream_attempts_after_stall_retry(monkeypatch, isolated_db):
+    """logs.attempts 记这次客户端请求打了几次上游：重打那一轮报 2，不是又报 1。"""
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    calls = _install_sequenced_stream_fakes(
+        monkeypatch,
+        [_stall_stream_chunks(), _tool_call_stream_chunks()],
+    )
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    async def run():
+        return b"".join([
+            chunk
+            async for chunk in proxy._stream_with_stall_guard(body, None, "test-model")
+        ])
+
+    asyncio.run(run())
+    assert [entry[1].get("attempts") for entry in calls["logs"]] == [1, 2]
 
 
 def test_stream_tool_loop_stall_retry_then_fail_stream(monkeypatch, isolated_db):
@@ -3774,6 +3817,32 @@ def test_stream_tool_loop_flushes_short_summary_answer(monkeypatch, isolated_db)
     assert len(calls["bodies"]) == 1
 
 
+def test_stream_tool_loop_does_not_retry_when_model_speaks(monkeypatch, isolated_db):
+    """回归：正文非空一律放行 —— 旧判据会把「好的，马上继续跑流程。」判成停转并重打。"""
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    text = "好的，马上继续跑流程。"
+    calls = _install_sequenced_stream_fakes(monkeypatch, [_content_stream_chunks(text)])
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    async def run():
+        return b"".join([
+            chunk
+            async for chunk in proxy._stream_with_stall_guard(body, None, "test-model")
+        ])
+
+    raw = asyncio.run(run())
+    payloads, done_count = _parse_chat_proxy_sse(raw)
+    assert done_count == 1
+    assert text.encode() in raw
+    assert len(calls["bodies"]) == 1, "正文非空不该触发重打"
+    terminal = [
+        p for p in payloads if (p.get("choices") or [{}])[0].get("finish_reason")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["choices"][0]["finish_reason"] == "stop"
+
+
 def test_stream_tool_loop_does_not_retry_complete_short_answer(monkeypatch, isolated_db):
     """回归：正文是完整短答案时不重打 —— 一次客户端请求只打一次上游。"""
     monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
@@ -3837,12 +3906,17 @@ def test_content_hold_passes_through_non_content_events():
 
 
 def _stall_stream_chunks() -> list[bytes]:
-    """上游流：纯文本增量 + finish_reason=stop（无任何工具调用）。"""
+    """上游流：只给了推理、正文一个字都没有就 finish_reason=stop（无工具调用）。
+
+    这是唯一还能确定判定的停转：正文为空（见 _looks_like_stall_text）。完全空白的流
+    （连推理都没有）由 eof_error 判成 incomplete_stream，走换号那条路，到不了这里。
+    """
     return [
         _role_stream_chunk(),
         _chat_sse({
             "id": "c1", "object": "chat.completion.chunk", "created": 1,
-            "choices": [{"index": 0, "delta": {"content": "好的，马上继续跑流程。"}, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": {"reasoning_content": "先想一下怎么做。"},
+                         "finish_reason": None}],
         }),
         _chat_sse({
             "id": "c1", "object": "chat.completion.chunk", "created": 1,

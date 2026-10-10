@@ -32,6 +32,13 @@ from buddy2api.reasoning_controls import (
 
 BACKEND = "https://copilot.tencent.com"
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+# 账号级故障（换号就是解法）与链路级故障（换号换不掉）分开给额度：前者用满
+# MAX_ACCOUNT_ATTEMPTS（必须大于账号池规模，见 auth_manager 里的注释），后者只给
+# LINK_LEVEL_MAX_ATTEMPTS 次。502/503/504/408/425 是上游网关或链路信号，在账号
+# 维度上不区分 —— 打满 8 个号等于把同一个故障重试 8 遍（2026-10-10 前实测：本机
+# DNS 没配好导致全站 502 时，每次请求白跑 8 个号 + 7 次退避，近 7 天 62 条 502 全是这样）。
+ACCOUNT_LEVEL_RETRY_STATUSES = {401, 403, 429}
+LINK_LEVEL_MAX_ATTEMPTS = int(os.environ.get("CB_GATEWAY_LINK_RETRY_ATTEMPTS", "2"))
 
 # 腾讯内容审核拦截时返回的固定话术特征（HTTP 200 + 正文是这段话）。
 # 仅匹配短拒答，避免正常回答引用审查文案时被误标。
@@ -72,27 +79,6 @@ TOOL_STALL_FAIL_STREAM = (
     in {"1", "true", "yes", "on"}
 )
 
-# 判停转只认「正向信号」：正文为空，或正文明确在说「我这就去办」而没有给出结论。
-# 早先的版本把「正文短于 400 字符」也当停转，但短正文不等于停转 —— 2026-10-10 用
-# logs.error_msg 复核近 7 天 647 条 tool_stall 记录，命中正向词的 0 条：全部是模型
-# 给出的完整短答案（结论、JSON 结果、收尾说明），被长度规则整轮判成停转后丢弃重打。
-# 所以删掉长度规则，默认放行。
-_STALL_POSITIVE_MARKERS = (
-    "马上继续", "请问您接下来", "这就去", "马上开始",
-    "我现在就", "这就开始", "稍等", "好的继续",
-)
-_STALL_POSITIVE_MARKERS_EN = (
-    "i'll continue", "i will continue", "let me continue",
-    "one moment", "hang on", "right away",
-)
-# 正向词的护栏：正文里已经给出结论/收尾的不算停转（「已继续跑完，结果如下」这类）。
-_STALL_NEGATIVE_MARKERS = (
-    "总结", "已完成", "结果如下", "以下是", "以上就是", "完成情况",
-)
-_STALL_NEGATIVE_MARKERS_EN = (
-    "in summary", "to summarize", "task complete", "already done",
-    "all done", "here's the result", "here is the result",
-)
 # 正文扣留窗口：正文累计超过这个字符数就放行转直通（见 _ContentHold）。
 _CONTENT_HOLD_LIMIT = 400
 
@@ -107,22 +93,14 @@ def _request_has_tool_loop(body: dict) -> bool:
     )
 
 
+# 停转判定只认一个确定事实：上游一个字都没给。不看长度、也不看措辞 —— 2026-10-10 用
+# logs.error_msg 复核近 7 天 647 条 tool_stall 记录：「短正文」和「正向话术」两条规则
+# 命中的真停转是 0 条，全部是模型给出的完整短答案（结论、JSON 结果、收尾说明）。
+# 代理层没有能力判断模型「是不是还想继续」，任何措辞启发式都是在猜，代价是拿一次
+# 完整 prompt 去赌 —— 所以只保留「上游什么都没说」这个事实。
 def _looks_like_stall_text(text: str) -> bool:
-    """高置信度停转判定：空正文，或「说了要动手」但没给结论。
-
-    只看正向信号，不看长度 —— 原因见 _STALL_POSITIVE_MARKERS 的注释。
-    """
-    collapsed = " ".join((text or "").split())
-    if not collapsed:
-        return True
-    if any(marker in collapsed for marker in _STALL_NEGATIVE_MARKERS):
-        return False
-    lower = collapsed.lower()
-    if any(marker in lower for marker in _STALL_NEGATIVE_MARKERS_EN):
-        return False
-    return any(marker in collapsed for marker in _STALL_POSITIVE_MARKERS) or any(
-        marker in lower for marker in _STALL_POSITIVE_MARKERS_EN
-    )
+    """停转判定：正文（去空白后）为空才算。"""
+    return not (text or "").strip()
 
 
 def _is_tool_stall(body: dict, finish_reason, tool_calls: bool, text: str) -> bool:
@@ -215,6 +193,30 @@ class _ContentHold:
 
 def _is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUS_CODES or status in {401, 403}
+
+
+def _plan_retry(
+    status: int,
+    attempt: int,
+    max_attempts: int,
+    link_failures: int,
+    model_blocked: bool = False,
+) -> tuple[bool, int]:
+    """这一轮失败后要不要再换一个账号试，并返回更新后的链路级失败计数。
+
+    账号级故障（401/403/429）换号就是解法，用满账号池额度；链路级故障
+    （5xx/408/409/425）换号换不掉，只给 LINK_LEVEL_MAX_ATTEMPTS 次；「这个账号
+    服务不了这个模型」不是账号故障，但换号同样有效，不占链路额度。
+    """
+    if model_blocked:
+        return attempt < max_attempts - 1, link_failures
+    if not _is_retryable_status(status):
+        return False, link_failures
+    if status not in ACCOUNT_LEVEL_RETRY_STATUSES:
+        link_failures += 1
+    if attempt >= max_attempts - 1:
+        return False, link_failures
+    return link_failures < LINK_LEVEL_MAX_ATTEMPTS, link_failures
 
 
 # 失败分类：写进请求日志的 finish_reason，也是对外 error.code。
@@ -1147,7 +1149,8 @@ def _usage_cached_tokens(usage: dict) -> int:
 def _log_request(api_key_info, account, model_name, stream,
                   prompt_t, completion_t, total_t, credit,
                   finish_reason, status_code, error_msg, t0,
-                  increment_usage: bool = True, cached_t: int = 0):
+                  increment_usage: bool = True, cached_t: int = 0,
+                  attempts: int = 1):
     elapsed_ms = int((time.time() - t0) * 1000)
     log_data = {
         "api_key_id": api_key_info["id"] if api_key_info else None,
@@ -1168,6 +1171,7 @@ def _log_request(api_key_info, account, model_name, stream,
         "duration_ms": elapsed_ms,
         "status_code": status_code,
         "error_msg": error_msg,
+        "attempts": attempts,
         "increment_usage": increment_usage,
     }
     try:
@@ -1186,6 +1190,7 @@ async def _json_chat_with_stall_retry(
     # 固定 3 次会让健康账号永远轮不到（见 MAX_ACCOUNT_ATTEMPTS 的注释）。
     max_retries = max(3, auth_manager.MAX_ACCOUNT_ATTEMPTS)
     last_error = None
+    link_failures = 0
 
     for attempt in range(max_retries):
         account = await auth_manager.pick_account_with_fallback(
@@ -1202,7 +1207,10 @@ async def _json_chat_with_stall_retry(
 
         url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
         t0 = time.time()
-        result = await _collect_stream(url, headers, body, account, api_key_info, model_name, t0)
+        result = await _collect_stream(
+            url, headers, body, account, api_key_info, model_name, t0,
+            attempts=attempt + 1,
+        )
         if result[0] == "json":
             # 工具停转：stop+纯文本且未调用工具时，用 tool_choice=required 再打一次。
             if TOOL_STALL_RETRY:
@@ -1217,7 +1225,8 @@ async def _json_chat_with_stall_retry(
                     retry_body = {**body, "tool_choice": "required"}
                     retry_t0 = time.time()
                     retry_result = await _collect_stream(
-                        url, headers, retry_body, account, api_key_info, model_name, retry_t0
+                        url, headers, retry_body, account, api_key_info, model_name, retry_t0,
+                        attempts=attempt + 2,
                     )
                     if retry_result[0] == "json":
                         retry_choice = (retry_result[1].get("choices") or [{}])[0]
@@ -1238,9 +1247,9 @@ async def _json_chat_with_stall_retry(
             auth_manager.mark_model_denied(account["id"], body.get("model"))
         else:
             auth_manager.mark_account_failure(account["id"], err_status, body.get("model"))
-        will_retry = (
-            model_blocked or _is_retryable_status(err_status)
-        ) and attempt < max_retries - 1
+        will_retry, link_failures = _plan_retry(
+            err_status, attempt, max_retries, link_failures, model_blocked
+        )
         error_message = detail
         if isinstance(detail, dict):
             error_data = detail.get("error") if isinstance(detail.get("error"), dict) else detail
@@ -1251,6 +1260,7 @@ async def _json_chat_with_stall_retry(
             0, 0, 0, 0, "retry" if will_retry else failure,
             err_status, _failure_log_message(failure, str(error_message)), t0,
             increment_usage=not will_retry,
+            attempts=attempt + 1,
         )
         if not will_retry:
             return result
@@ -1274,7 +1284,7 @@ async def _stream_with_stall_guard(
     客户端一个字都收不到）。现在改成只扣住正文增量，推理内容即时下发。
 
     重打是「追加」：第一轮的正文会先补发，再接着写第二轮（见 can_retry_stall 分支）。
-    判定（_looks_like_stall_text）只认空正文和明确的继续话术，默认放行。
+    判定（_looks_like_stall_text）只认「上游一个字都没给」，正文非空一律放行。
     """
     report: dict = {}
     async for chunk in _stream_upstream(
@@ -1296,6 +1306,7 @@ async def _stream_with_stall_guard(
         report=retry_report,
         preferred_account=report.get("account"),
         max_attempts=2,
+        attempt_offset=report.get("attempts", 0),
     ):
         yield chunk
 
@@ -1388,6 +1399,7 @@ async def _stream_upstream(
     report: Optional[dict] = None,
     preferred_account: Optional[dict] = None,
     max_attempts: Optional[int] = None,
+    attempt_offset: int = 0,
 ) -> AsyncGenerator[bytes, None]:
     """Stream upstream SSE with pre-output account failover and backoff.
 
@@ -1397,6 +1409,9 @@ async def _stream_upstream(
     preferred_account / max_attempts 供停转重打那一轮收窄范围：重打是「再问一遍」，
     锁在第一轮的账号上、只给很小的换号额度，免得重打轮又跑一遍完整的换号循环 ——
     两个循环各自 8 次时一次客户端请求的上游调用上界是 16 次，实测出现过 9 次。
+
+    attempt_offset 是停转重打传进来的「前面已经打过几次上游」，只用于把 logs.attempts
+    记成这次客户端请求的累计值（重打那一轮报 2，而不是又报 1）。
     """
     tried_ids: set[int] = set()
     last_error = b"No available accounts"
@@ -1406,6 +1421,8 @@ async def _stream_upstream(
     last_account = None
     last_started = time.time()
     pending_retry_log: dict | None = None
+    link_failures = 0
+    last_attempts = max(1, attempt_offset)
     # 同 _json_chat_with_stall_retry：重试额度要大于可用账号数，否则健康账号会被
     # 一批正在限流的账号挤在窗口外。重打那一轮由调用方传更小的额度进来。
     max_attempts = (
@@ -1437,10 +1454,14 @@ async def _stream_upstream(
                 pending_retry_log["message"],
                 pending_retry_log["started"],
                 increment_usage=False,
+                attempts=pending_retry_log.get("attempts", 1),
             )
             await _retry_delay(pending_retry_log["attempt"])
             pending_retry_log = None
         last_account = account
+        # 这次客户端请求累计打到上游的第几次（换号与停转重打都累加），写进 logs.attempts。
+        attempts_now = attempt_offset + attempt + 1
+        last_attempts = attempts_now
         tried_ids.add(account["id"])
         headers = await auth_manager.get_valid_headers(account)
         if not headers:
@@ -1501,9 +1522,11 @@ async def _stream_upstream(
                             auth_manager.mark_account_failure(
                                 account["id"], response.status_code, body.get("model")
                             )
-                        if (
-                            model_blocked or _is_retryable_status(response.status_code)
-                        ) and attempt < max_attempts - 1:
+                        will_retry, link_failures = _plan_retry(
+                            response.status_code, attempt, max_attempts,
+                            link_failures, model_blocked,
+                        )
+                        if will_retry:
                             pending_retry_log = {
                                 "account": account,
                                 "prompt_tokens": 0,
@@ -1514,12 +1537,14 @@ async def _stream_upstream(
                                 "message": _failure_log_message(failure, http_msg),
                                 "started": t0,
                                 "attempt": attempt,
+                                "attempts": attempts_now,
                             }
                             continue
                         _log_request(
                             api_key_info, account, model_name, True,
                             0, 0, 0, 0, failure, response.status_code,
                             _failure_log_message(failure, http_msg), t0,
+                            attempts=attempts_now,
                         )
                         yield _err_sse_event(last_error, response.status_code, failure)
                         return
@@ -1628,7 +1653,11 @@ async def _stream_upstream(
             last_status = 502
             last_failure = failure
             auth_manager.mark_account_failure(account["id"], 502, body.get("model"))
-            if not output_started and attempt < max_attempts - 1:
+            # 流中断/截断也走链路额度：它同样是链路级故障，不该打满账号池。
+            will_retry, link_failures = _plan_retry(
+                502, attempt, max_attempts, link_failures
+            )
+            if will_retry and not output_started:
                 pending_retry_log = {
                     "account": account,
                     "prompt_tokens": observer.usage.get("prompt_tokens", 0),
@@ -1639,6 +1668,7 @@ async def _stream_upstream(
                     "message": _failure_log_message(failure, eof_error),
                     "started": t0,
                     "attempt": attempt,
+                    "attempts": attempts_now,
                 }
                 continue
             _log_request(
@@ -1649,6 +1679,7 @@ async def _stream_upstream(
                 observer.usage.get("credit", 0),
                 failure, 502, _failure_log_message(failure, eof_error), t0,
                 cached_t=_usage_cached_tokens(observer.usage),
+                attempts=attempts_now,
             )
             if observer.upstream_error_event is not None:
                 yield _json_sse_event(observer.upstream_error_event)
@@ -1689,11 +1720,13 @@ async def _stream_upstream(
             cached_t=_usage_cached_tokens(observer.usage),
             # 要重打的一轮不计用量，最终结果由重打那一轮记账（避免一次请求算两次）。
             increment_usage=not can_retry_stall,
+            attempts=attempts_now,
         )
         if report is not None:
             report["stall"] = tool_stall
             report["content_released"] = hold.released if hold is not None else True
             report["account"] = account
+            report["attempts"] = attempts_now
         if tool_stall and TOOL_STALL_FAIL_STREAM and not can_retry_stall:
             # 流式已发出文本增量，无法回退重试；把本回合标记为失败，
             # 让有重试机制的客户端（DSH / OpenCode 等）自动重试。
@@ -1748,6 +1781,7 @@ async def _stream_upstream(
         failure, final_failure["status"],
         _failure_log_message(failure, final_failure["message"]),
         final_failure["started"],
+        attempts=final_failure.get("attempts", last_attempts),
     )
     if last_error_event is not None:
         yield _json_sse_event(last_error_event)
@@ -1760,6 +1794,7 @@ async def _collect_stream(
     url: str, headers: dict, body: dict,
     account: dict, api_key_info: Optional[dict],
     model_name: str, t0: float,
+    attempts: int = 1,
 ) -> tuple:
     """聚合 SSE 流为单个非流式 JSON。"""
     content_parts: list[str] = []
@@ -1887,5 +1922,6 @@ async def _collect_stream(
         u.get("credit", 0),
         finish_reason or "stop", 200, "", t0,
         cached_t=_usage_cached_tokens(u),
+        attempts=attempts,
     )
     return ("json", result)

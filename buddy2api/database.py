@@ -167,6 +167,7 @@ def init_db():
             total_tokens    INTEGER DEFAULT 0,
             credit          REAL DEFAULT 0,
             cached_tokens   INTEGER DEFAULT 0,
+            attempts        INTEGER DEFAULT 0,
             finish_reason   TEXT,
             duration_ms     INTEGER,
             status_code     INTEGER,
@@ -380,6 +381,9 @@ def _migrate_logs_provider(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE logs ADD COLUMN provider TEXT")
     if "cached_tokens" not in cols:
         conn.execute("ALTER TABLE logs ADD COLUMN cached_tokens INTEGER DEFAULT 0")
+    if "attempts" not in cols:
+        # 这次客户端请求实际打到上游几次（换号 + 停转重打都累加）；0 = 旧数据未统计。
+        conn.execute("ALTER TABLE logs ADD COLUMN attempts INTEGER DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider)")
 
 
@@ -1097,8 +1101,9 @@ def record_request(data: dict):
                 INSERT INTO logs
                     (api_key_id, api_key_name, account_id, account_name, model, stream,
                      prompt_tokens, completion_tokens, total_tokens, credit, cached_tokens,
-                     finish_reason, duration_ms, status_code, error_msg, provider, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     attempts, finish_reason, duration_ms, status_code, error_msg, provider,
+                     created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     data.get("api_key_id"), data.get("api_key_name"),
@@ -1107,6 +1112,7 @@ def record_request(data: dict):
                     data.get("prompt_tokens", 0), data.get("completion_tokens", 0),
                     data.get("total_tokens", 0), data.get("credit", 0),
                     data.get("cached_tokens", 0),
+                    data.get("attempts", 0),
                     data.get("finish_reason", ""), data.get("duration_ms", 0),
                     data.get("status_code", 200), data.get("error_msg", ""),
                     data.get("provider") or "workbuddy", now,
