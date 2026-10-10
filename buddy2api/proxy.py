@@ -72,15 +72,20 @@ TOOL_STALL_FAIL_STREAM = (
     in {"1", "true", "yes", "on"}
 )
 
+# 判停转只认「正向信号」：正文为空，或正文明确在说「我这就去办」而没有给出结论。
+# 早先的版本把「正文短于 400 字符」也当停转，但短正文不等于停转 —— 2026-10-10 用
+# logs.error_msg 复核近 7 天 647 条 tool_stall 记录，命中正向词的 0 条：全部是模型
+# 给出的完整短答案（结论、JSON 结果、收尾说明），被长度规则整轮判成停转后丢弃重打。
+# 所以删掉长度规则，默认放行。
 _STALL_POSITIVE_MARKERS = (
-    "马上继续", "继续跑", "接下来需要", "请问您接下来",
-    "这就去", "马上开始", "我现在就", "这就开始", "稍等",
-    "好的继续",
+    "马上继续", "请问您接下来", "这就去", "马上开始",
+    "我现在就", "这就开始", "稍等", "好的继续",
 )
 _STALL_POSITIVE_MARKERS_EN = (
     "i'll continue", "i will continue", "let me continue",
-    "continuing", "got it", "one moment", "hang on", "right away",
+    "one moment", "hang on", "right away",
 )
+# 正向词的护栏：正文里已经给出结论/收尾的不算停转（「已继续跑完，结果如下」这类）。
 _STALL_NEGATIVE_MARKERS = (
     "总结", "已完成", "结果如下", "以下是", "以上就是", "完成情况",
 )
@@ -88,7 +93,8 @@ _STALL_NEGATIVE_MARKERS_EN = (
     "in summary", "to summarize", "task complete", "already done",
     "all done", "here's the result", "here is the result",
 )
-_STALL_SHORT_LIMIT = 400
+# 正文扣留窗口：正文累计超过这个字符数就放行转直通（见 _ContentHold）。
+_CONTENT_HOLD_LIMIT = 400
 
 
 def _request_has_tool_loop(body: dict) -> bool:
@@ -102,18 +108,18 @@ def _request_has_tool_loop(body: dict) -> bool:
 
 
 def _looks_like_stall_text(text: str) -> bool:
-    """空内容或短的非总结回复视为 stall；长文本仍要像确认话术。"""
-    text = (text or "").strip()
-    if not text:
+    """高置信度停转判定：空正文，或「说了要动手」但没给结论。
+
+    只看正向信号，不看长度 —— 原因见 _STALL_POSITIVE_MARKERS 的注释。
+    """
+    collapsed = " ".join((text or "").split())
+    if not collapsed:
         return True
-    collapsed = " ".join(text.split())
-    lower = collapsed.lower()
     if any(marker in collapsed for marker in _STALL_NEGATIVE_MARKERS):
         return False
+    lower = collapsed.lower()
     if any(marker in lower for marker in _STALL_NEGATIVE_MARKERS_EN):
         return False
-    if len(collapsed) <= _STALL_SHORT_LIMIT:
-        return True
     return any(marker in collapsed for marker in _STALL_POSITIVE_MARKERS) or any(
         marker in lower for marker in _STALL_POSITIVE_MARKERS_EN
     )
@@ -164,8 +170,9 @@ class _ContentHold:
     停转判定只看正文（见 _is_tool_stall），不看 reasoning_content，所以推理内容始终
     即时下发 —— 客户端至少能立刻看到思考过程，而不是干等。
 
-    阈值用原始字符数近似 _looks_like_stall_text 里「去空白后的长度」：可能极少数
-    情况下提前放行（正文含大量空白），后果只是这一轮不再重打、原样透传，不会误伤。
+    阈值用原始字符数。判定（_looks_like_stall_text）已经不看长度了，这个阈值现在
+    只决定「扣留多久」：正文写到这个量说明模型在正常输出，没必要继续扣着，早放行
+    让客户端尽快看到。
     """
 
     def __init__(self, limit: int):
@@ -1260,11 +1267,14 @@ async def _stream_with_stall_guard(
     api_key_info: Optional[dict],
     model_name: str,
 ) -> AsyncGenerator[bytes, None]:
-    """工具回合：先按流式转发，停转且正文未下发时再用 tool_choice=required 重打一次。
+    """工具回合：先按流式转发，停转时用 tool_choice=required 在同一账号上再补一轮。
 
     替代早先的 _stream_collected_with_stall_retry —— 那条路为了能回退重打，把上游响应
     整段收完才吐给客户端，导致工具回合全程没有流式输出（实测单轮静默 6~186 秒，
     客户端一个字都收不到）。现在改成只扣住正文增量，推理内容即时下发。
+
+    重打是「追加」：第一轮的正文会先补发，再接着写第二轮（见 can_retry_stall 分支）。
+    判定（_looks_like_stall_text）只认空正文和明确的继续话术，默认放行。
     """
     report: dict = {}
     async for chunk in _stream_upstream(
@@ -1272,16 +1282,20 @@ async def _stream_with_stall_guard(
     ):
         yield chunk
 
-    # 正文已经发出去就收不回来了；只有「停转 + 正文未下发」才值得重打。
+    # 正文已经放行说明模型在正常输出，不再补一轮。
     if not report.get("stall") or report.get("content_released"):
         return
 
+    # 重打只问一遍，且锁在第一轮的账号上：停转是模型行为而不是账号故障，换账号没有
+    # 依据；顺带避免「同一份 prompt 在两个账号上各打一遍」（实测成对日志里账号常不同）。
     retry_report: dict = {}
     async for chunk in _stream_upstream(
         {**body, "tool_choice": "required"},
         api_key_info,
         model_name,
         report=retry_report,
+        preferred_account=report.get("account"),
+        max_attempts=2,
     ):
         yield chunk
 
@@ -1372,11 +1386,17 @@ async def _stream_upstream(
     model_name: str,
     hold_content: bool = False,
     report: Optional[dict] = None,
+    preferred_account: Optional[dict] = None,
+    max_attempts: Optional[int] = None,
 ) -> AsyncGenerator[bytes, None]:
     """Stream upstream SSE with pre-output account failover and backoff.
 
     hold_content=True 时正文增量先扣在 _ContentHold 里（见该类注释）；report 用来把
-    「这一轮是否停转、正文有没有下发」回传给调用方，决定要不要整轮重打。
+    「这一轮是否停转、正文有没有放行、用的哪个账号」回传给调用方，决定要不要重打。
+
+    preferred_account / max_attempts 供停转重打那一轮收窄范围：重打是「再问一遍」，
+    锁在第一轮的账号上、只给很小的换号额度，免得重打轮又跑一遍完整的换号循环 ——
+    两个循环各自 8 次时一次客户端请求的上游调用上界是 16 次，实测出现过 9 次。
     """
     tried_ids: set[int] = set()
     last_error = b"No available accounts"
@@ -1387,13 +1407,19 @@ async def _stream_upstream(
     last_started = time.time()
     pending_retry_log: dict | None = None
     # 同 _json_chat_with_stall_retry：重试额度要大于可用账号数，否则健康账号会被
-    # 一批正在限流的账号挤在窗口外。
-    max_attempts = max(3, auth_manager.MAX_ACCOUNT_ATTEMPTS)
+    # 一批正在限流的账号挤在窗口外。重打那一轮由调用方传更小的额度进来。
+    max_attempts = (
+        max(3, auth_manager.MAX_ACCOUNT_ATTEMPTS) if max_attempts is None
+        else max(1, int(max_attempts))
+    )
 
     for attempt in range(max_attempts):
-        account = await auth_manager.pick_account_with_fallback(
-            tried_ids, model=body.get("model")
-        )
+        if preferred_account is not None:
+            account, preferred_account = preferred_account, None
+        else:
+            account = await auth_manager.pick_account_with_fallback(
+                tried_ids, model=body.get("model")
+            )
         if not account:
             break
         if pending_retry_log is not None:
@@ -1430,7 +1456,7 @@ async def _stream_upstream(
         last_started = t0
         observer = _ChatStreamObserver(body.get("model") or model_name, body.get("n", 1))
         decoder = _SSEEventDecoder()
-        hold = _ContentHold(_STALL_SHORT_LIMIT) if hold_content else None
+        hold = _ContentHold(_CONTENT_HOLD_LIMIT) if hold_content else None
         output_started = False
         pending_terminal_events: list[bytes] = []
         pending_terminal_bytes = 0
@@ -1645,7 +1671,7 @@ async def _stream_upstream(
         audit_blocked = _looks_like_audit_block(full_text)
         finish_reason = next((reason for reason in observer.finish_reasons.values() if reason), None)
         tool_stall = _is_tool_stall(body, finish_reason, bool(observer.tool_call_choices), full_text)
-        # 停转 + 正文一个字节都没下发 → 这一轮可以整轮重打（见 _stream_with_stall_guard）。
+        # 停转 + 正文还没放行 → 这一轮可以在它后面再补一轮（见 _stream_with_stall_guard）。
         can_retry_stall = bool(hold is not None and tool_stall and not hold.released)
         log_finish = "content_filter" if audit_blocked else ("tool_stall" if tool_stall else (finish_reason or "stop"))
         log_error = (
@@ -1667,6 +1693,7 @@ async def _stream_upstream(
         if report is not None:
             report["stall"] = tool_stall
             report["content_released"] = hold.released if hold is not None else True
+            report["account"] = account
         if tool_stall and TOOL_STALL_FAIL_STREAM and not can_retry_stall:
             # 流式已发出文本增量，无法回退重试；把本回合标记为失败，
             # 让有重试机制的客户端（DSH / OpenCode 等）自动重试。
@@ -1682,8 +1709,12 @@ async def _stream_upstream(
             yield b"data: [DONE]\n\n"
             return
         if can_retry_stall:
-            # 这一轮要整轮重打，客户端不该看到它的任何输出（含终止事件与 [DONE]）。
-            hold.drop()
+            # 重打是「追加」不是「替换」：先把这一轮的正文补发出去，再让重打那一轮
+            # 接着写。终止事件与 [DONE] 仍不发，由重打那一轮收尾 —— 客户端看到的
+            # 是一条连续消息（先「我这就去办」再工具调用）。早先是整轮丢弃，误判时
+            # 会把模型本来正确的收尾一起扔掉。
+            for event in hold.flush():
+                yield event
             return
         if hold is not None:
             # 不是停转（或已转直通）时，把扣留的正文补发出去。

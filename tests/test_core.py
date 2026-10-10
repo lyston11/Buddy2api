@@ -3492,18 +3492,44 @@ def test_nonstream_collection_validates_completion(monkeypatch, isolated_db, ter
         assert "finish reason" in result[1][1]["error"]["message"]
 
 
-def test_stall_detection_short_english_ack():
+def test_stall_detection_ignores_short_acks():
+    """短回复不等于停转：单纯确认语、短英文回答都放行，只有明确的继续话术才判停转。"""
     body = _tool_loop_body()
-    assert proxy._looks_like_stall_text("OK.")
-    assert proxy._looks_like_stall_text("Got it, continuing.")
-    assert proxy._is_tool_stall(body, "stop", False, "Let me write it.")
+    assert not proxy._looks_like_stall_text("OK.")
+    assert not proxy._looks_like_stall_text("Got it, continuing.")
+    assert not proxy._is_tool_stall(body, "stop", False, "Let me write it.")
     assert not proxy._looks_like_stall_text("In summary, the three files are done.")
+    assert proxy._looks_like_stall_text("I'll continue right away.")
 
 
 def test_stall_detection_rejects_summary():
     body = _tool_loop_body()
     assert not proxy._looks_like_stall_text("任务完成，总结如下：共处理 3 个文件。")
     assert not proxy._is_tool_stall(body, "stop", False, "任务完成，总结如下：共处理 3 个文件。")
+
+
+# 2026-10-10 用 logs.error_msg 复核近 7 天 647 条 tool_stall 记录得到的真实误判样本：
+# 这些正文被「短于 400 字符」的长度规则判成停转，整轮丢弃后用 tool_choice=required
+# 重打。它们全是模型给出的完整答案（JSON 结果、结论、收尾说明），没有一条命中正向词
+# —— 也就是那些重打全部打错了对象。
+_REAL_FALSE_POSITIVE_TEXTS = (
+    '[{"kind":"direct_sibling","subject":"n003","object":"n004"}]',
+    '{"items": []}',
+    "```json\n[23, 24]\n```",
+    "§117§ 已删除，无残留。",
+    "工具读取全部失败（`get_space_snapshot`、`list_space_nodes`、`get_evidence`、"
+    "`get_relationship_path` 均返回 `INTERNAL_ERROR` 500），因此无法获取任何已发布"
+    "投影、证据或关系路径。\n\n在无证据可依的情况下，我按给定顺序保持稳定输出：\n\n"
+    "```json\n[25, 26]\n```",
+)
+
+
+def test_stall_detection_accepts_real_short_answers():
+    """回归：短正文不等于停转 —— 用线上真实误判样本钉住（旧的长度规则全判错）。"""
+    body = _tool_loop_body()
+    for text in _REAL_FALSE_POSITIVE_TEXTS:
+        assert not proxy._looks_like_stall_text(text), text
+        assert not proxy._is_tool_stall(body, "stop", False, text), text
 
 
 def test_stall_detection_requires_tool_loop_and_tools():
@@ -3629,8 +3655,12 @@ def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkey
     assert calls == [None, "required"]
 
 
-def test_stream_tool_loop_retries_stall_and_hides_stalled_text(monkeypatch, isolated_db):
-    """流式工具回合停转 → 用 tool_choice=required 重打；停转那次的正文不能漏给客户端。"""
+def test_stream_tool_loop_appends_retry_after_stalled_text(monkeypatch, isolated_db):
+    """流式工具回合停转 → 用 tool_choice=required 再补一轮；第一轮正文先补发。
+
+    重打是「追加」不是「替换」：早先会把第一轮整轮丢弃，误判时连模型本来正确的
+    收尾一起扔掉（见 test_stall_detection_accepts_real_short_answers）。
+    """
     monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
     calls = _install_sequenced_stream_fakes(
         monkeypatch,
@@ -3648,8 +3678,10 @@ def test_stream_tool_loop_retries_stall_and_hides_stalled_text(monkeypatch, isol
     payloads, done_count = _parse_chat_proxy_sse(raw)
     assert done_count == 1
     assert [sent.get("tool_choice") for sent in calls["bodies"]] == [None, "required"]
-    assert "好的，马上继续跑流程。".encode() not in raw
-    # 被丢弃那一轮不能留下正文或终止事件（无正文的 role 增量会透传，客户端按 role 合并即可）
+    stalled = "好的，马上继续跑流程。".encode()
+    assert stalled in raw, "第一轮的正文必须补发给客户端，不能丢"
+    assert raw.index(stalled) < raw.index(b'"tool_calls"'), "先补发第一轮正文，再写工具调用"
+    # 终止事件只留重打那一轮的（第一轮的 finish_reason=stop 不能漏出去）
     terminal = [
         p for p in payloads if (p.get("choices") or [{}])[0].get("finish_reason")
     ]
@@ -3657,10 +3689,6 @@ def test_stream_tool_loop_retries_stall_and_hides_stalled_text(monkeypatch, isol
     assert terminal[0]["choices"][0]["finish_reason"] == "tool_calls"
     assert any(
         (p.get("choices") or [{}])[0].get("delta", {}).get("tool_calls")
-        for p in payloads
-    )
-    assert any(
-        (p.get("choices") or [{}])[0].get("finish_reason") == "tool_calls"
         for p in payloads
     )
 
@@ -3746,8 +3774,38 @@ def test_stream_tool_loop_flushes_short_summary_answer(monkeypatch, isolated_db)
     assert len(calls["bodies"]) == 1
 
 
+def test_stream_tool_loop_does_not_retry_complete_short_answer(monkeypatch, isolated_db):
+    """回归：正文是完整短答案时不重打 —— 一次客户端请求只打一次上游。"""
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    text = '[{"kind":"direct_sibling","subject":"n003","object":"n004"}]'
+    calls = _install_sequenced_stream_fakes(monkeypatch, [_content_stream_chunks(text)])
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    async def run():
+        return b"".join([
+            chunk
+            async for chunk in proxy._stream_with_stall_guard(body, None, "test-model")
+        ])
+
+    raw = asyncio.run(run())
+    payloads, done_count = _parse_chat_proxy_sse(raw)
+    assert done_count == 1
+    streamed = "".join(
+        (p.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
+        for p in payloads
+    )
+    assert streamed == text
+    assert len(calls["bodies"]) == 1, "完整短答案不该触发重打"
+    terminal = [
+        p for p in payloads if (p.get("choices") or [{}])[0].get("finish_reason")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["choices"][0]["finish_reason"] == "stop"
+
+
 def test_content_hold_release_flush_drop():
-    """_ContentHold 的三种出口：超阈值放行 / 遇工具调用放行 / 重打前丢弃。"""
+    """_ContentHold 的三种出口：超阈值放行 / 遇工具调用放行 / 显式丢弃（fail-stream 用）。"""
     hold = proxy._ContentHold(limit=10)
     assert hold.feed(b"a", 4, False) == []
     assert hold.feed(b"b", 4, False) == []
