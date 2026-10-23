@@ -32,7 +32,7 @@ from buddy2api.upstream_transport import transport_for
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 
-# 官方 Work Buddy / CodeBuddy CLI 客户端指纹（见 fingerprint.py）。
+# 官方 WorkBuddy 客户端指纹（桌面端/CLI 两套 profile，见 fingerprint.py）。
 # 兼容保留 CB_GATEWAY_USER_AGENT 覆盖；如上游不接受新 UA，
 # 设 CB_GATEWAY_USER_AGENT=codebuddy2openai/2.0 可回退到历史 UA。
 USER_AGENT = fingerprint.user_agent()
@@ -1088,7 +1088,7 @@ def _fingerprint_account(account: dict) -> dict:
 
 
 def build_headers(account: dict) -> dict:
-    """Chat 请求头：官方 CLI 完整指纹（通用 + 账号 + IDE/CLI + SDK）。"""
+    """Chat 请求头：官方客户端完整指纹（通用 + 账号 + 身份 + 会话 + 追踪）。"""
     return fingerprint.chat_headers(_fingerprint_account(account))
 
 

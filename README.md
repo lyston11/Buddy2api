@@ -189,6 +189,20 @@ CB_GATEWAY_ADMIN_TOKEN=cb-admin-请换成足够长的随机值 python -m buddy2a
 
 设 `CB_GATEWAY_INTL_PROXY=off` 可关掉国际站强制走代理，退回原来的直连优先。
 
+### 上游的渠道校验（400 code 11128）
+
+上游在 `/v2/chat/completions` 上会判断「这次请求是不是官方客户端发出的」，不通过就回 `400 {"code":11128,…}`，displayTips 的原话是「这次调用没通过渠道校验，可能不是官方客户端发出的」。2026-10-24 用逐个删头的方式实测，它今天只认三件事：
+
+1. **首条消息必须是 system**。缺了是 `msg: first message is not system prompt`。客户端不一定带 system（比如标题生成请求），所以网关会自动补一条（`CB_GATEWAY_SYSTEM_PROMPT` 可改文案）。
+2. **必须带 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`**。删掉任意一个、哪怕别的头全在，都会变成 `msg: request illegal`。
+3. **User-Agent 决定落到哪条后端流水线**：`WorkBuddy/<版本> …` 走桌面端会话流水线，`CLI/<版本> CodeBuddy/<版本>` 走 CLI 流水线。
+
+其余身份头（`X-IDE-*`、`X-Private-Data`、`X-Agent-Intent/Purpose/Type`、`traceparent`/`b3`、`acp-connection-id`、`Origin`/`Referer`）删掉不影响判定，但网关仍按官方客户端的真实形态发，留出余量；官方客户端不发的 `x-stainless-*` 则不再带。默认身份是**桌面端 WorkBuddy**：UA 自称 `WorkBuddy/<桌面端版本> … CLI/<内置 CLI 版本>`，版本号从本机安装的客户端读取（国际版 `WorkBuddy AI.app`、国内版 `WorkBuddy.app`，两个站点各读各的），读不到才用内置回退值。`CB_GATEWAY_CHANNEL=cli` 可切回「命令行 CodeBuddy」身份。
+
+会话 id 按「这段对话」派生（首条 system + 第一条 user 的哈希），多轮续聊稳定不变——官方客户端就是一个会话一个 id，每次请求都换新会话是它不会出现的形态；每条消息的 `X-Conversation-Message-ID` / `X-Request-ID` 仍逐次新生成。`CB_GATEWAY_CONVERSATION_ID=random` 可退回每次随机。
+
+万一上游改严了校验规则，网关把 11128 当成**渠道问题**而不是账号问题：换另一套身份（桌面端 ↔ CLI）在**同一个账号**上重试一次，不给账号记失败、不占换号额度；两套身份都被拒才如实报错，日志类别记 `channel_verification`。
+
 ## 从 1.4.x 升级
 
 启动时会自动改数据库。旧 Key 视为绑在 `workbuddy` 上，原来的 `auto` / `glm-5.2` 还能用。
@@ -265,7 +279,7 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 
 ### 失败分类
 
-请求日志的 `finish_reason` 对上游失败分为四类：`upstream_http`（上游返回了 HTTP 错误）、`upstream_disconnect`（连接被断开）、`incomplete_stream`（流提前结束，缺少 `[DONE]` 或 `finish_reason`）、`parse_error`（SSE 事件解析不了）。`error_msg` 带 `[类别]` 前缀；空正文写成 `upstream HTTP 502, empty body`，httpx 异常没有文案时保留异常类型名。`/v1/responses` 的 `error.code` 同样用这些类别。换号重试仍记 `retry`，正文里带类别前缀。日志筛选里的「错误」按 `status_code` 判定，中间重试行照常能查到。
+请求日志的 `finish_reason` 对上游失败分为五类：`upstream_http`（上游返回了 HTTP 错误）、`upstream_disconnect`（连接被断开）、`incomplete_stream`（流提前结束，缺少 `[DONE]` 或 `finish_reason`）、`parse_error`（SSE 事件解析不了）、`channel_verification`（上游渠道校验不通过，见上一节；换过身份仍被拒才会落到这里）。`error_msg` 带 `[类别]` 前缀；空正文写成 `upstream HTTP 502, empty body`，httpx 异常没有文案时保留异常类型名。`/v1/responses` 的 `error.code` 同样用这些类别。换号重试仍记 `retry`，正文里带类别前缀。日志筛选里的「错误」按 `status_code` 判定，中间重试行照常能查到。
 
 ### 思考强度
 
@@ -345,7 +359,11 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_GATEWAY_DB_PATH` | 数据库路径 |
 | `CB_GATEWAY_MASTER_KEY` | 跨系统搬数据库时的加密主密钥 |
 | `CB_GATEWAY_LOG_RETENTION_DAYS` | 日志保留天数，默认 `90` |
-| `CB_GATEWAY_USER_AGENT` | 只影响 WorkBuddy 出站头，默认 `CLI/2.109.2 CodeBuddy/2.109.2` |
+| `CB_GATEWAY_CHANNEL` | WorkBuddy 出站身份：`app`（桌面端，默认）或 `cli`（命令行）。两者都是官方客户端，上游按 UA 分流到不同流水线 |
+| `CB_GATEWAY_APP_VERSION` | 冒充的桌面端版本，默认从本机安装的客户端读取（国际版/国内版各读各的） |
+| `CB_GATEWAY_CLI_VERSION` | 冒充的内置 CLI 版本，默认从客户端里读取（旧名 `CB_GATEWAY_IDE_VERSION` 仍认） |
+| `CB_GATEWAY_CONVERSATION_ID` | 设为 `random` 则每次请求随机 `X-Conversation-ID`；默认按会话稳定派生 |
+| `CB_GATEWAY_USER_AGENT` | 整体覆盖 WorkBuddy 出站 User-Agent，默认按当前身份自拼 |
 
 ## 数据和安全
 

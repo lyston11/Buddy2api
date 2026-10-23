@@ -22,6 +22,7 @@ import httpx
 
 import buddy2api.database as db
 import buddy2api.auth_manager as auth_manager
+import buddy2api.fingerprint as fingerprint
 from buddy2api.paths import PROJECT_ROOT
 from buddy2api.upstream_transport import transport_for
 from buddy2api.reasoning_controls import (
@@ -219,17 +220,31 @@ def _plan_retry(
     return link_failures < LINK_LEVEL_MAX_ATTEMPTS, link_failures
 
 
+def _plan_channel_retry(used: int) -> bool:
+    """渠道校验失败后要不要换一套身份再打一次（见 _channel_verification_error）。
+
+    11128 说的是「这次请求的头/体不像官方客户端发出的」，与账号无关：换账号没有
+    意义（所有账号共用同一套指纹，换号照样被拒），换 profile 才是解法。所以只给
+    一个独立额度、并且不改账号状态。
+    """
+    return used < CHANNEL_RETRY_LIMIT
+
+
 # 失败分类：写进请求日志的 finish_reason，也是对外 error.code。
 # 排障时能直接区分「上游 HTTP 报错」「连接断开」「流被截断」「SSE 解析不了」。
 FAILURE_UPSTREAM_HTTP = "upstream_http"
 FAILURE_UPSTREAM_DISCONNECT = "upstream_disconnect"
 FAILURE_INCOMPLETE_STREAM = "incomplete_stream"
 FAILURE_PARSE_ERROR = "parse_error"
+# 上游渠道校验拒绝（见 _channel_verification_error）：不是账号故障，也不是链路故障，
+# 而是「这一侧发出去的头/体不符合官方客户端形态」，单独一类便于排障。
+FAILURE_CHANNEL = "channel_verification"
 FAILURE_CLASSES = {
     FAILURE_UPSTREAM_HTTP,
     FAILURE_UPSTREAM_DISCONNECT,
     FAILURE_INCOMPLETE_STREAM,
     FAILURE_PARSE_ERROR,
+    FAILURE_CHANNEL,
 }
 
 
@@ -285,6 +300,29 @@ def _model_unavailable_error(status: int, detail) -> bool:
     if node.get("code") == _MODEL_UNAVAILABLE_CODE:
         return True
     return str(node.get("msg") or node.get("message") or "").startswith("model [")
+
+
+# 上游的渠道校验：认为「这次请求不是官方客户端发出的」时的业务码。实测两种文案，
+# 都是 HTTP 400（2026-10-24 逐头对照实测，见 fingerprint.py 开头）：
+#   first message is not system prompt   首条消息不是 system
+#   request illegal                      缺 X-Conversation-ID / -Request-ID / -Message-ID
+# 判定依据只有我们这一侧的头与请求体，与账号本身无关 —— 不记账号失败、不耗换号额度，
+# 换一套身份（app ↔ cli）重试一次才对。
+_CHANNEL_VERIFICATION_CODE = 11128
+CHANNEL_RETRY_LIMIT = 1
+
+
+def _channel_verification_error(status: int, detail) -> bool:
+    """上游是否以「渠道校验不通过」为由拒绝。"""
+    if status != 400 or not isinstance(detail, dict):
+        return False
+    node = detail.get("error") if isinstance(detail.get("error"), dict) else detail
+    if not isinstance(node, dict):
+        return False
+    if node.get("code") == _CHANNEL_VERIFICATION_CODE:
+        return True
+    text = str(node.get("msg") or node.get("message") or "").strip().lower()
+    return "channel verification" in text or text.startswith("first message is not system")
 
 
 async def _retry_delay(attempt: int):
@@ -1191,11 +1229,18 @@ async def _json_chat_with_stall_retry(
     max_retries = max(3, auth_manager.MAX_ACCOUNT_ATTEMPTS)
     last_error = None
     link_failures = 0
+    channel_retries = 0
+    # 渠道校验失败要换身份重试，但账号必须不变（11128 与账号无关），
+    # 所以这里记住它、下一轮直接用，不让选号器换一家。
+    channel_account: Optional[dict] = None
 
     for attempt in range(max_retries):
-        account = await auth_manager.pick_account_with_fallback(
-            tried_ids, model=body.get("model")
-        )
+        if channel_account is not None:
+            account, channel_account = channel_account, None
+        else:
+            account = await auth_manager.pick_account_with_fallback(
+                tried_ids, model=body.get("model")
+            )
         if not account:
             break
 
@@ -1240,10 +1285,28 @@ async def _json_chat_with_stall_retry(
         last_error = result
         err_status = result[1][0]
         detail = result[1][1]
+        channel_blocked = _channel_verification_error(err_status, detail)
+        # 渠道校验失败：换一套指纹（app ↔ cli）在同一账号上再打一次，不碰账号状态。
+        if channel_blocked and _plan_channel_retry(channel_retries):
+            channel_retries += 1
+            fingerprint.switch_channel()
+            tried_ids.discard(account["id"])
+            channel_account = account
+            _log_request(
+                api_key_info, account, model_name, False,
+                0, 0, 0, 0, "retry",
+                err_status, _failure_log_message(FAILURE_CHANNEL, json.dumps(detail, ensure_ascii=False)),
+                t0, increment_usage=False, attempts=attempt + 1,
+            )
+            await _retry_delay(attempt)
+            continue
         # 模型不属于这个账号的站点：换号就能成功，别把账号记成故障（它本身是好的），
         # 但要记住「这个账号服务不了这个模型」，下次直接跳过、不再浪费一次往返。
         model_blocked = _model_unavailable_error(err_status, detail)
-        if model_blocked:
+        if channel_blocked:
+            # 换过身份还是被渠道校验拒：这是网关侧的头/体问题，不该让账号背锅。
+            pass
+        elif model_blocked:
             auth_manager.mark_model_denied(account["id"], body.get("model"))
         else:
             auth_manager.mark_account_failure(account["id"], err_status, body.get("model"))
@@ -1254,7 +1317,9 @@ async def _json_chat_with_stall_retry(
         if isinstance(detail, dict):
             error_data = detail.get("error") if isinstance(detail.get("error"), dict) else detail
             error_message = error_data.get("message", detail) if isinstance(error_data, dict) else detail
-        failure = _failure_from_detail(detail, err_status)
+        failure = FAILURE_CHANNEL if channel_blocked else _failure_from_detail(detail, err_status)
+        if channel_blocked:
+            will_retry = False
         _log_request(
             api_key_info, account, model_name, False,
             0, 0, 0, 0, "retry" if will_retry else failure,
@@ -1326,6 +1391,14 @@ async def proxy_chat_completions(
     """
     client_wants_stream = bool(payload.get("stream"))
     body = build_backend_body(payload)
+    # 每个客户端请求重置指纹上下文：渠道覆盖清空、会话 id 按这段对话派生
+    # （见 fingerprint.begin_request）。放在建体之后，是因为会话指纹取自补过
+    # system 的消息列表。
+    fingerprint.begin_request(
+        fingerprint.conversation_key(
+            body.get("messages"), (api_key_info or {}).get("id")
+        )
+    )
     if log_model is None and isinstance(api_key_info, dict):
         log_model = api_key_info.get("_log_model")
     model_name = log_model if log_model is not None else payload.get("model", "auto")
@@ -1360,6 +1433,7 @@ async def test_account_chat(account: dict, model: str = "auto", prompt: str = "p
         "messages": [{"role": "user", "content": prompt or "ping"}],
         "stream": False,
     })
+    fingerprint.begin_request(fingerprint.conversation_key(body.get("messages")))
     url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
     t0 = time.time()
     result = await _collect_stream(url, headers, body, account, None, f"account-test:{model or 'auto'}", t0)
@@ -1422,6 +1496,8 @@ async def _stream_upstream(
     last_started = time.time()
     pending_retry_log: dict | None = None
     link_failures = 0
+    channel_retries = 0
+    channel_account: Optional[dict] = None
     last_attempts = max(1, attempt_offset)
     # 同 _json_chat_with_stall_retry：重试额度要大于可用账号数，否则健康账号会被
     # 一批正在限流的账号挤在窗口外。重打那一轮由调用方传更小的额度进来。
@@ -1431,7 +1507,9 @@ async def _stream_upstream(
     )
 
     for attempt in range(max_attempts):
-        if preferred_account is not None:
+        if channel_account is not None:
+            account, channel_account = channel_account, None
+        elif preferred_account is not None:
             account, preferred_account = preferred_account, None
         else:
             account = await auth_manager.pick_account_with_fallback(
@@ -1509,12 +1587,40 @@ async def _stream_upstream(
                         last_status = response.status_code
                         last_failure = failure
                         detail = _safe_err(raw_error, response.status_code)
+                        channel_blocked = _channel_verification_error(
+                            response.status_code, detail
+                        )
+                        # 渠道校验失败：换一套指纹（app ↔ cli）在同一账号上再打一次。
+                        # 11128 说的是我们这侧的头/体形态，与账号无关，所以既不给
+                        # 账号记失败、也不占换号或链路额度。
+                        if channel_blocked and _plan_channel_retry(channel_retries):
+                            channel_retries += 1
+                            fingerprint.switch_channel()
+                            tried_ids.discard(account["id"])
+                            channel_account = account
+                            pending_retry_log = {
+                                "account": account,
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0,
+                                "credit": 0,
+                                "status": response.status_code,
+                                "message": _failure_log_message(FAILURE_CHANNEL, http_msg),
+                                "started": t0,
+                                "attempt": attempt,
+                                "attempts": attempts_now,
+                            }
+                            continue
                         # 见 _model_unavailable_error：模型不属于这个账号的站点，
                         # 换号能成功，别把账号记成故障。
                         model_blocked = _model_unavailable_error(
                             response.status_code, detail
                         )
-                        if model_blocked:
+                        if channel_blocked:
+                            # 换过身份仍被拒：网关侧的头/体问题，不给账号记失败。
+                            failure = FAILURE_CHANNEL
+                            last_failure = FAILURE_CHANNEL
+                        elif model_blocked:
                             auth_manager.mark_model_denied(
                                 account["id"], body.get("model")
                             )
@@ -1522,10 +1628,13 @@ async def _stream_upstream(
                             auth_manager.mark_account_failure(
                                 account["id"], response.status_code, body.get("model")
                             )
-                        will_retry, link_failures = _plan_retry(
-                            response.status_code, attempt, max_attempts,
-                            link_failures, model_blocked,
-                        )
+                        if channel_blocked:
+                            will_retry, link_failures = False, link_failures
+                        else:
+                            will_retry, link_failures = _plan_retry(
+                                response.status_code, attempt, max_attempts,
+                                link_failures, model_blocked,
+                            )
                         if will_retry:
                             pending_retry_log = {
                                 "account": account,
