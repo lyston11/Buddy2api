@@ -12,6 +12,7 @@ import re
 import httpx
 
 import buddy2api.auth_manager as auth_manager
+from buddy2api.catalog import description_text
 from buddy2api.upstream_transport import transport_for
 from buddy2api.model_capacity import capacity_fields
 from buddy2api.model_reasoning import reasoning_fields
@@ -43,7 +44,9 @@ def parse_supplier_models(payload) -> list[dict]:
         item = {"id": mid, "name": name or mid}
         item.update(capacity_fields(row))
         item.update(reasoning_fields(row))
-        description = str(row.get("description") or "")
+        # 官方说明在 descriptionZh / descriptionEn 里（如「已更新至 V4.1-Flash-1017
+        # 最新版」），只认 description 会把版本信息整个丢掉。
+        description = description_text(row)
         if description:
             item["description"] = description
         # 官方客户端模型选择器里的「x0.79 / Free now」就来自这个字段：上游给出的是

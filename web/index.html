@@ -1346,7 +1346,7 @@ const app=createApp({
     <table class="cat-table"><thead><tr><th>模型 ID</th><th>名称</th><th>扣费基准</th><th>来源</th><th>操作</th></tr></thead><tbody>
     <tr v-for="(x,i) in visibleModels(s)" :key="s.channel+'-'+i">
       <td class="mono">{{s.channel}}/{{x.id}}</td>
-      <td>{{x.name||x.id}}</td>
+      <td>{{x.name||x.id}}<div v-if="x.description" class="muted" style="font-size:11px;line-height:1.45;margin-top:2px">{{x.description}}</div></td>
       <td class="mono" :title="creditTitle(x)">{{creditText(x)}}</td>
       <td><span v-if="x.hidden" class="tag warn">已删除</span><span v-else-if="x.manual" class="tag">手动</span><span v-else class="muted">官方</span></td>
       <td><button class="btn s danger" @click="rmExtra(s.channel,x.id)">{{x.hidden?'取消删除':'删除'}}</button></td>

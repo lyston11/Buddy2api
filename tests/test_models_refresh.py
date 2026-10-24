@@ -116,6 +116,48 @@ def test_workbuddy_reasoning_survives_supplier_catalog_and_public_listing(isolat
     assert "summary" not in stored[1].get("reasoning", {})
 
 
+def test_supplier_description_keeps_zh_version_note(isolated_db, all_channels):
+    """上游把官方说明放在 descriptionZh/descriptionEn 里，只认 description 会丢版本号。
+
+    实测背景（2026-10 国内站目录）：deepseek-v4.1-flash 的 descriptionZh 是
+    「已更新至 V4.1-Flash-1017最新版，支持1M上下文窗口，原生多模态」——上游没有
+    单独的 version 字段、响应体里的 model 也只有裸 id，说明文本是唯一能看出
+    「当前是 1017 版」的地方，丢了用户就只能靠行为探测猜。
+    """
+    import buddy2api.catalog as catalog
+    from buddy2api.providers.workbuddy.models import parse_supplier_models
+
+    payload = {
+        "data": {
+            "models": [
+                {
+                    "id": "deepseek-v4.1-flash",
+                    "name": "Deepseek-V4.1-Flash",
+                    "descriptionZh": "已更新至 V4.1-Flash-1017最新版，支持1M上下文窗口，原生多模态",
+                    "descriptionEn": "DeepSeek flagship model, native multimodal model",
+                },
+                {"id": "glm-5.3", "descriptionEn": "English only"},
+                {"id": "hy3", "description": "plain description"},
+                {"id": "kimi-k3", "descriptionZh": "   "},
+            ]
+        }
+    }
+    parsed = {item["id"]: item for item in parse_supplier_models(payload)}
+    assert parsed["deepseek-v4.1-flash"]["description"].startswith("已更新至 V4.1-Flash-1017")
+    # 中文缺失才退到英文，别为了「有值」把中文覆盖成英文。
+    assert parsed["glm-5.3"]["description"] == "English only"
+    assert parsed["hy3"]["description"] == "plain description"
+    assert "description" not in parsed["kimi-k3"]
+
+    # 目录页读的是 catalog_snapshot，落库后说明不能丢。
+    catalog.save_catalog("workbuddy", catalog.normalize_models(list(parsed.values())))
+    source = next(
+        item for item in catalog.catalog_snapshot()["sources"] if item["channel"] == "workbuddy"
+    )
+    row = next(item for item in source["models"] if item["id"] == "deepseek-v4.1-flash")
+    assert "1017" in row["description"]
+
+
 def test_empty_or_invalid_reasoning_is_not_published():
     from buddy2api.model_reasoning import reasoning_fields
 

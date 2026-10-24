@@ -54,6 +54,26 @@ def save_catalog(channel: str, models: list[dict]) -> None:
     db.set_setting(CATALOG_SETTING, catalogs)
 
 
+# 上游说明字段名不统一：WorkBuddy 给的是 descriptionZh / descriptionEn（官方客户端的
+# 「已更新至 V4.1-Flash-1017最新版」就在前者里），别的通道用 description。
+_DESCRIPTION_KEYS = ("description", "descriptionZh", "descriptionEn")
+
+
+def description_text(row: Any) -> str:
+    """取官方说明文本（中文优先、英文兜底）；都没有就返回空串。
+
+    只做展示，不参与路由：版本号（如 1017）是上游写在说明里的，唯一拿得到的地方
+    就是模型目录，丢了用户在页面上就看不到「当前是哪一版」。
+    """
+    if not isinstance(row, dict):
+        return ""
+    for key in _DESCRIPTION_KEYS:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def normalize_models(rows: Any) -> list[dict]:
     if not isinstance(rows, list):
         return []
@@ -73,7 +93,7 @@ def normalize_models(rows: Any) -> list[dict]:
                 or ""
             ).strip()
             name = str(row.get("name") or row.get("display_id") or row.get("display_name") or mid)
-            description = str(row.get("description") or "")
+            description = description_text(row)
         else:
             continue
         if not mid or mid in seen:
