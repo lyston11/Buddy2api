@@ -1005,6 +1005,43 @@ async def admin_checkin_status(
     return await auth_manager.fetch_checkin_status(account, force=bool(force))
 
 
+@app.post("/admin/accounts/health-probe")
+async def admin_probe_accounts_health(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """健康巡检：逐个账号真发一条最小请求，按上游业务码判定能不能用。
+
+    与 scripts/account_probe.py 同一套语义；这里给管理页的「健康巡检」按钮用。
+    会真的打上游（每个账号一次、max_tokens=4），所以只在用户点击时执行。
+    """
+    _check_admin(authorization)
+    try:
+        payload = await _read_json_object(request)
+    except Exception:
+        payload = {}
+    channels = payload.get("channels")
+    if isinstance(channels, str):
+        channels = [channels]
+    if channels is not None and not isinstance(channels, list):
+        raise HTTPException(status_code=400, detail="channels must be a list")
+    account_ids = payload.get("account_ids")
+    if account_ids is not None and not isinstance(account_ids, list):
+        raise HTTPException(status_code=400, detail="account_ids must be a list")
+    model = str(payload.get("model") or "").strip() or None
+    kwargs = {
+        "channel_filter": channels,
+        "account_ids": [int(value) for value in account_ids] if account_ids else None,
+        "mark": payload.get("mark", True) is not False,
+    }
+    if model:
+        kwargs["model"] = model
+    try:
+        return await control_plane.probe_accounts_health(**kwargs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/admin/accounts/checkin-status-all")
 async def admin_checkin_status_all(
     force: int = 0,

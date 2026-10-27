@@ -510,6 +510,159 @@ async def checkin_status_all(force: bool = False) -> dict:
     }
 
 
+# 健康巡检的判定：上游把「这个号不能用」放在 error.data.code 里，HTTP status 只是
+# 粗包装（14017/14018 是 429、11140 是 403），所以结论必须按业务码给。
+# 与 scripts/account_probe.py 共用同一套语义。
+PROBE_MODEL = "deepseek-v4.1-flash"
+_PROBE_REASON_TEXT = {
+    14017: "试用未激活（需重新登录激活）",
+    14018: "积分耗尽",
+    11140: "账号级风控封禁",
+    11141: "账号级授权封禁",
+    11142: "账号级授权封禁",
+    11102: "该站点没有这个模型",
+}
+
+
+def _probe_error_code(raw: bytes) -> int:
+    import json as _json
+
+    try:
+        payload = _json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return 0
+    node = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(node, dict):
+        data = node.get("data")
+        if isinstance(data, dict) and isinstance(data.get("code"), int):
+            return data["code"]
+        if isinstance(node.get("code"), int):
+            return node["code"]
+    if isinstance(payload, dict) and isinstance(payload.get("code"), int):
+        return payload["code"]
+    return 0
+
+
+async def probe_account_health(account: dict, model: str = PROBE_MODEL) -> dict:
+    """对一个账号发一条最小的真实流式请求，判断它现在还能不能用。
+
+    只发一次、`max_tokens=4`、`stream=True`（上游不支持非流式 chat），成本可以忽略；
+    但它是**真实请求**，所以只在用户手动点「健康巡检」时跑，不做定时轮询。
+    """
+    import buddy2api.fingerprint as fingerprint
+    import buddy2api.upstream_transport as upstream_transport
+
+    aid = int(account["id"])
+    domain = str(account.get("domain") or "").strip()
+    result = {
+        "account_id": aid,
+        "account_name": account.get("nickname") or account.get("name") or "",
+        "domain": domain,
+        "status": account.get("status") or "",
+        "provider": account.get("provider") or "workbuddy",
+        "http": 0,
+        "code": 0,
+        "ok": False,
+        "verdict": "",
+        "detail": "",
+    }
+    if not str(account.get("access_token") or "").strip():
+        result.update(verdict="无可用凭据", detail="库里没有可解密的 access_token")
+        return result
+
+    body = {
+        "model": model,
+        "stream": True,
+        "max_tokens": 4,
+        "messages": [
+            {"role": "system", "content": "pong"},
+            {"role": "user", "content": "pong"},
+        ],
+    }
+    fingerprint.begin_request(None)
+    try:
+        async with upstream_transport.client_scope(account, 30.0) as client:
+            async with client.stream(
+                "POST",
+                f"https://{domain}/v2/chat/completions",
+                headers=fingerprint.chat_headers(account),
+                json=body,
+            ) as response:
+                head = b""
+                async for chunk in response.aiter_bytes():
+                    head += chunk
+                    if len(head) > 2000:
+                        break
+                result["http"] = response.status_code
+                if response.status_code == 200:
+                    result.update(ok=True, verdict="正常")
+                elif response.status_code == 401:
+                    result.update(
+                        verdict="凭据被拒",
+                        detail="上游网关直接 401，refresh_token 可能已被服务端销毁",
+                    )
+                else:
+                    code = _probe_error_code(head)
+                    result["code"] = code
+                    result["verdict"] = _PROBE_REASON_TEXT.get(
+                        code, f"上游 HTTP {response.status_code}"
+                    )
+                    result["detail"] = head[:200].decode("utf-8", "replace").replace("\n", " ")
+    except Exception as exc:  # 网络问题也要如实反映
+        result.update(verdict="网络不可达", detail=f"{type(exc).__name__}: {exc}"[:160])
+    return result
+
+
+async def probe_accounts_health(
+    channel_filter: list[str] | None = None,
+    account_ids: list[int] | None = None,
+    model: str = PROBE_MODEL,
+    mark: bool = True,
+) -> dict:
+    """批量健康巡检。默认并发 2，避免同一时刻对上游打太多请求。
+
+    `mark=True` 时把上游明确判定不可用的账号直接打上长冷却（见
+    auth_manager.ACCOUNT_UNAVAILABLE_CODES），这样巡检完选路就会跳过它们。
+    """
+    wanted_channels = set(channel_filter) if channel_filter else None
+    wanted_ids = {int(value) for value in account_ids} if account_ids else None
+    results: list[dict] = []
+    for channel in providers.enabled_provider_ids():
+        if wanted_channels is not None and channel not in wanted_channels:
+            continue
+        # 巡检要看全部账号（含 inactive/expired）：被停用的号恰恰是最该被巡检确认的，
+        # 只查 active 会让「被封的号」永远从报告里消失。
+        accounts = await _channel_accounts(channel, status="")
+        if wanted_ids is not None:
+            accounts = [a for a in accounts if int(a["id"]) in wanted_ids]
+        if not accounts:
+            continue
+        chunk = await _gather_limited(
+            accounts, lambda account: probe_account_health(account, model), limit=2
+        )
+        for item in chunk:
+            item["channel"] = channel
+        results.extend(chunk)
+
+    marked = 0
+    if mark:
+        for item in results:
+            if not item.get("ok") and item.get("code") in auth_manager.ACCOUNT_UNAVAILABLE_CODES:
+                if auth_manager.mark_account_unavailable(item["account_id"], item["code"]):
+                    marked += 1
+                    item["marked"] = True
+
+    broken = [item for item in results if not item.get("ok")]
+    return {
+        "total": len(results),
+        "ok": len(results) - len(broken),
+        "broken": len(broken),
+        "marked": marked,
+        "model": model,
+        "results": results,
+    }
+
+
 async def checkin_all(channel_filter: list[str] | None = None) -> dict:
     wanted = set(channel_filter) if channel_filter else None
     results = []

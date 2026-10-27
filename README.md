@@ -382,7 +382,12 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 
 账号级不可用会写进 `/admin/accounts` 的 `unavailable_reason` / `unavailable_code` / `unavailable_seconds_left`，管理页状态列直接显示，冷却期内不参与选路。刷新 token 成功或复核通过会自动清掉。
 
-排查用 `python scripts/account_probe.py`：逐个账号真发一条最小请求，按业务码给出结论（`--id 9` 只看某个号，`--json` 给监控用，`--mark` 顺手打冷却）。
+两个入口，功能等价：
+
+- **管理页**：账号管理 → 工具栏「健康巡检」按钮 → 弹窗逐账号列出 `HTTP / 业务码 / 结论`，被判定不可用的账号当场打上长冷却（弹窗里会显示「已打长冷却 N 个」）。
+- **命令行**：`python scripts/account_probe.py`（`--id 9` 只看某个号，`--json` 给监控用，`--mark` 顺手打冷却）。
+
+两者都覆盖 inactive/expired 账号 —— 被封的号往往就是被停用的那个，只查 active 会让它从报告里消失。巡检是**手动触发**的真实请求（每账号一次、`stream`、`max_tokens=4`），不做定时轮询。
 
 ## 数据和安全
 

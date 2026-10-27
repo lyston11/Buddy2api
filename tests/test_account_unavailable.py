@@ -144,3 +144,77 @@ def test_plan_retry_plain_429_still_rate_limit_flow():
         429, attempt=0, max_attempts=8, link_failures=0
     )
     assert will_retry is True and link == 0
+
+
+# ---------------------------------------------------------------- 健康巡检
+
+def test_health_probe_marks_unavailable_and_reports_verdicts(isolated_db, monkeypatch):
+    """巡检要按业务码给结论，并把不可用的账号打上长冷却。"""
+    import buddy2api.control_plane as control_plane
+    import buddy2api.providers as providers
+
+    good = _make_account("good")
+    trial = _make_account("trial")
+    dead = _make_account("dead")
+
+    async def fake_probe(account, model=None):
+        aid = int(account["id"])
+        if aid == good:
+            return {"account_id": aid, "account_name": account["name"], "http": 200,
+                    "code": 0, "ok": True, "verdict": "正常", "detail": ""}
+        if aid == trial:
+            return {"account_id": aid, "account_name": account["name"], "http": 429,
+                    "code": 14017, "ok": False, "verdict": "试用未激活", "detail": "trial"}
+        return {"account_id": aid, "account_name": account["name"], "http": 401,
+                "code": 0, "ok": False, "verdict": "凭据被拒", "detail": "401"}
+
+    monkeypatch.setattr(control_plane, "probe_account_health", fake_probe)
+    monkeypatch.setattr(
+        control_plane, "_channel_accounts",
+        lambda channel, status="active": _async_list(db.list_accounts(provider=channel)),
+    )
+    monkeypatch.setattr(providers, "enabled_provider_ids", lambda: ["workbuddy"])
+
+    report = asyncio.run(control_plane.probe_accounts_health(mark=True))
+
+    assert report["total"] == 3 and report["ok"] == 1 and report["broken"] == 2
+    assert report["marked"] == 1, "只有业务码是账号级不可用的那个才打冷却"
+    assert auth_manager.account_unavailable_reason(trial), "14017 的账号要进长冷却"
+    assert auth_manager.account_unavailable_reason(dead) is None, "401 走凭证复核，不在这里标"
+
+
+def test_health_probe_reports_every_account_including_inactive(isolated_db, monkeypatch):
+    """巡检必须覆盖 inactive 账号 —— 被封的号往往就是被停用的那个。"""
+    import buddy2api.control_plane as control_plane
+    import buddy2api.providers as providers
+
+    _make_account("active-one")
+    inactive = db.add_account({
+        "name": "inactive-one", "uid": "inactive-one", "provider": "workbuddy",
+        "access_token": "t", "domain": "www.workbuddy.ai", "status": "inactive",
+        "expires_at": 4_000_000_000_000,
+    })
+    seen = []
+
+    async def fake_probe(account, model=None):
+        seen.append(int(account["id"]))
+        return {"account_id": int(account["id"]), "account_name": account["name"],
+                "http": 200, "code": 0, "ok": True, "verdict": "正常", "detail": ""}
+
+    monkeypatch.setattr(control_plane, "probe_account_health", fake_probe)
+    monkeypatch.setattr(
+        control_plane, "_channel_accounts",
+        lambda channel, status="active": _async_list(
+            [a for a in db.list_accounts(provider=channel) if not status or a["status"] == status]
+        ),
+    )
+    monkeypatch.setattr(providers, "enabled_provider_ids", lambda: ["workbuddy"])
+
+    report = asyncio.run(control_plane.probe_accounts_health(mark=False))
+    assert inactive in seen and len(report["results"]) == 2
+
+
+def _async_list(items):
+    async def _inner():
+        return items
+    return _inner()

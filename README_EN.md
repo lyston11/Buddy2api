@@ -334,7 +334,12 @@ Every "this account is unusable" verdict lives in upstream's `error.data.code`; 
 
 Account-level unavailability shows up in `/admin/accounts` as `unavailable_reason` / `unavailable_code` / `unavailable_seconds_left` and is rendered in the status column; such accounts are skipped while cooling down. A successful token refresh or credential re-check clears the flag.
 
-To investigate, run `python scripts/account_probe.py`: it sends one minimal request per account and reports the verdict by business code (`--id 9` for one account, `--json` for monitoring, `--mark` to apply the cooldown).
+Two equivalent entry points:
+
+- **Dashboard**: Accounts → the **健康巡检 / health probe** button in the toolbar → a dialog lists `HTTP / business code / verdict` per account and applies the long cooldown to any account the upstream rejects (the dialog reports how many were marked).
+- **CLI**: `python scripts/account_probe.py` (`--id 9` for one account, `--json` for monitoring, `--mark` to apply the cooldown).
+
+Both cover inactive/expired accounts too — a banned account is usually the one that got disabled, so probing only active ones would hide it. The probe is a manually triggered real request (one per account, `stream`, `max_tokens=4`); there is no scheduled polling.
 
 ## License
 
