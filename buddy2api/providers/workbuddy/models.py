@@ -13,7 +13,7 @@ import httpx
 
 import buddy2api.auth_manager as auth_manager
 from buddy2api.catalog import description_text
-from buddy2api.upstream_transport import transport_for
+from buddy2api.upstream_transport import client_scope
 from buddy2api.model_capacity import capacity_fields
 from buddy2api.model_reasoning import reasoning_fields
 
@@ -100,10 +100,11 @@ async def fetch_supplier_models(account: dict) -> list[dict]:
     if not headers:
         raise WorkBuddyModelsError("no usable WorkBuddy token")
     headers = dict(headers)
-    headers.pop("Content-Type", None)
-    headers["Accept"] = "application/json"
+    # 头名按官方客户端形态写小写（见 fingerprint.py），这里也用小写键
+    headers.pop("content-type", None)
+    headers["accept"] = "application/json"
     url = f"{auth_manager.backend_url_for(account)}{MODELS_PATH}"
-    async with httpx.AsyncClient(timeout=30.0, transport=transport_for(account)) as client:
+    async with client_scope(account, 30.0) as client:
         response = await client.get(url, headers=headers)
     if response.status_code >= 400:
         raise WorkBuddyModelsError(f"models HTTP {response.status_code}")

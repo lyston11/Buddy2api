@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import buddy2api.credential_crypto as credential_crypto
+from conftest import patch_upstream_client
 import buddy2api.database as db
 import buddy2api.providers as providers
 import buddy2api.router as router
@@ -425,7 +426,7 @@ def _install_supplier_http(monkeypatch):
     monkeypatch.setattr("buddy2api.providers.qclaw.jprx.httpx.AsyncClient", FakeAsyncClient)
     monkeypatch.setattr("buddy2api.providers.traework.models.httpx.AsyncClient", FakeAsyncClient)
     monkeypatch.setattr("buddy2api.providers.qwenwork.models.httpx.AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr("buddy2api.providers.workbuddy.models.httpx.AsyncClient", FakeAsyncClient)
+    patch_upstream_client(monkeypatch, FakeAsyncClient())
     return requested
 
 

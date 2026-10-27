@@ -89,10 +89,11 @@ def test_channel_rejection_retries_same_account_with_other_profile(monkeypatch):
     seen: list[str] = []
 
     async def fake_headers(acct):
-        return {"Authorization": "Bearer x", "X-IDE-Type": fingerprint.chat_headers(acct)["X-IDE-Type"]}
+        headers = fingerprint.chat_headers(acct)
+        return {"authorization": "Bearer x", "x-ide-type": headers["x-ide-type"]}
 
     async def fake_collect(url, headers, body, acct, api_key_info, model_name, t0, attempts=1):
-        seen.append(headers["X-IDE-Type"])
+        seen.append(headers["x-ide-type"])
         if len(seen) == 1:
             return ("error", (400, {"code": 11128, "msg": "request illegal"}))
         return ("json", {"id": "ok", "choices": [], "usage": {"total_tokens": 0}})
@@ -122,10 +123,11 @@ def test_channel_rejection_twice_reports_without_blaming_account(monkeypatch):
     seen: list[str] = []
 
     async def fake_headers(acct):
-        return {"Authorization": "Bearer x", "X-IDE-Type": fingerprint.chat_headers(acct)["X-IDE-Type"]}
+        headers = fingerprint.chat_headers(acct)
+        return {"authorization": "Bearer x", "x-ide-type": headers["x-ide-type"]}
 
     async def fake_collect(url, headers, body, acct, api_key_info, model_name, t0, attempts=1):
-        seen.append(headers["X-IDE-Type"])
+        seen.append(headers["x-ide-type"])
         return ("error", (400, {"code": 11128, "msg": "request illegal"}))
 
     async def no_delay(_attempt):
@@ -168,7 +170,8 @@ def test_channel_retry_locks_the_same_account(monkeypatch):
         return None
 
     async def fake_headers(acct):
-        return {"Authorization": "Bearer x", "X-IDE-Type": fingerprint.chat_headers(acct)["X-IDE-Type"]}
+        headers = fingerprint.chat_headers(acct)
+        return {"authorization": "Bearer x", "x-ide-type": headers["x-ide-type"]}
 
     seen: list[int] = []
 

@@ -24,7 +24,7 @@ import buddy2api.database as db
 import buddy2api.auth_manager as auth_manager
 import buddy2api.fingerprint as fingerprint
 from buddy2api.paths import PROJECT_ROOT
-from buddy2api.upstream_transport import transport_for
+from buddy2api.upstream_transport import client_scope
 from buddy2api.reasoning_controls import (
     chat_reasoning_effort,
     resolve_reasoning_control,
@@ -1568,9 +1568,10 @@ async def _stream_upstream(
                 write=30,
                 pool=10,
             )
-            # transport 按账号站点选：国际站一律走代理，其余直连优先、建连失败兜底
-            # （见 upstream_transport.transport_for 的排障说明）
-            async with httpx.AsyncClient(timeout=timeout, transport=transport_for(account)) as client:
+            # 出站客户端按（站点、代理、超时）复用：国际站一律走代理，其余直连优先、
+            # 建连失败兜底；连接常驻，与官方客户端的 keep-alive agent 同形
+            # （见 upstream_transport.shared_client / transport_for）
+            async with client_scope(account, timeout) as client:
                 async with client.stream("POST", url, headers=headers, json=body) as response:
                     if response.status_code != 200:
                         raw_error = await response.aread()
@@ -1915,9 +1916,7 @@ async def _collect_stream(
     seen_done = False
 
     try:
-        async with httpx.AsyncClient(
-            timeout=auth_manager.request_timeout(300), transport=transport_for(account)
-        ) as c:
+        async with client_scope(account, auth_manager.request_timeout(300)) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()

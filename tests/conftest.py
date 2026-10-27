@@ -13,6 +13,7 @@ import pytest
 
 import buddy2api.credential_crypto as credential_crypto
 import buddy2api.database as db
+import buddy2api.upstream_transport as upstream_transport
 
 
 @pytest.fixture(autouse=True)
@@ -23,3 +24,14 @@ def _isolate_gateway_db(tmp_path, monkeypatch):
     db.init_db()
     yield
     credential_crypto.reset_cache()
+
+
+def patch_upstream_client(monkeypatch, client):
+    """把出站客户端换成假客户端。
+
+    proxy / auth_manager 现在都通过 `upstream_transport.client_scope` 拿**共享**客户端
+    （复用的 keep-alive 连接，见 upstream_transport.shared_client），所以替换点统一在
+    `upstream_transport.shared_client`，而不是各自的 `httpx.AsyncClient`。
+    """
+    monkeypatch.setattr(upstream_transport, "shared_client", lambda *args, **kwargs: client)
+    return client

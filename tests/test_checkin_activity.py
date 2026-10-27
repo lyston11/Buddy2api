@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 import buddy2api.auth_manager as auth_manager
+from conftest import patch_upstream_client
 import buddy2api.control_plane as control_plane
 import buddy2api.credential_crypto as credential_crypto
 import buddy2api.database as db
@@ -141,10 +142,7 @@ def test_inactive_site_is_not_reported_as_failure(isolated_db, monkeypatch):
     aid = _make_account(domain=INTL_DOMAIN)
     client = _FakeClient(_FakeResponse(200, INTL_INACTIVE_PAYLOAD))
 
-    def factory(*args, **kwargs):
-        return client
-
-    monkeypatch.setattr(auth_manager.httpx, "AsyncClient", factory)
+    patch_upstream_client(monkeypatch, client)
 
     result = asyncio.run(auth_manager.claim_daily_checkin(db.get_account(aid)))
 
@@ -176,10 +174,7 @@ def test_active_site_still_claims_normally(isolated_db, monkeypatch):
 
     monkeypatch.setattr(client, "post", post)
 
-    def factory(*args, **kwargs):
-        return client
-
-    monkeypatch.setattr(auth_manager.httpx, "AsyncClient", factory)
+    patch_upstream_client(monkeypatch, client)
 
     result = asyncio.run(auth_manager.claim_daily_checkin(db.get_account(aid)))
 

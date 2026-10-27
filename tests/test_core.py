@@ -12,6 +12,7 @@ from fastapi import HTTPException
 import buddy2api.credential_crypto as credential_crypto
 import buddy2api.database as db
 import buddy2api.proxy as proxy
+from conftest import patch_upstream_client
 import buddy2api.reasoning_controls as reasoning_controls
 import buddy2api.responses as responses
 import buddy2api.server as server
@@ -572,7 +573,7 @@ def _collect_chat_proxy_stream(
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
     monkeypatch.setattr(proxy, "_log_request", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+    patch_upstream_client(monkeypatch, FakeAsyncClient())
 
     async def collect():
         return b"".join([
@@ -680,7 +681,7 @@ def _install_chat_account_stream_fakes(
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
     monkeypatch.setattr(proxy, "_retry_delay", retry_delay)
     monkeypatch.setattr(proxy, "_log_request", record_log)
-    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+    patch_upstream_client(monkeypatch, FakeAsyncClient())
     return calls
 
 
@@ -743,7 +744,7 @@ def _install_sequenced_stream_fakes(monkeypatch, streams: list[list[bytes]]) -> 
     monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
     monkeypatch.setattr(proxy, "_log_request", lambda *a, **k: calls["logs"].append((a, k)))
-    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+    patch_upstream_client(monkeypatch, FakeAsyncClient())
     return calls
 
 
@@ -2141,7 +2142,7 @@ def _collect_non_stream_upstream(monkeypatch, delta):
         def stream(self, *args, **kwargs):
             return FakeResponse()
 
-    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+    patch_upstream_client(monkeypatch, FakeAsyncClient())
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
 
     return asyncio.run(proxy._collect_stream(
@@ -3302,7 +3303,7 @@ def test_chat_proxy_stream_logs_disconnect_class(monkeypatch):
             return FakeResponse()
 
     calls = _install_chat_account_stream_fakes(monkeypatch, accounts, {1: []})
-    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+    patch_upstream_client(monkeypatch, FakeAsyncClient())
 
     async def collect():
         return b"".join([
@@ -3384,7 +3385,7 @@ def test_valid_headers_is_async_and_uses_decrypted_token(isolated_db):
     )
     account = db.get_account(account_id)
     headers = asyncio.run(auth_manager.get_valid_headers(account))
-    assert headers["Authorization"] == "Bearer access-secret"
+    assert headers["authorization"] == "Bearer access-secret"
 
 
 def test_codex_sanitize_skips_non_codex_prompts():
@@ -3482,7 +3483,7 @@ def test_nonstream_collection_validates_completion(monkeypatch, isolated_db, ter
         async def __aexit__(self, *args): return False
         def stream(self, *args, **kwargs): return Response()
 
-    monkeypatch.setattr(proxy.httpx, "AsyncClient", Client)
+    patch_upstream_client(monkeypatch, Client())
     result = asyncio.run(proxy._collect_stream(
         "https://upstream.test", {}, {}, {"id": 1}, None, "test", time.time()
     ))

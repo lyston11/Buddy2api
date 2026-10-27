@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import buddy2api.auth_manager as auth_manager
+from conftest import patch_upstream_client
 import buddy2api.credential_crypto as credential_crypto
 import buddy2api.database as db
 
@@ -183,10 +184,7 @@ class _FakeClient:
 def _patch_client(monkeypatch, response) -> _FakeClient:
     client = _FakeClient(response)
 
-    def factory(*args, **kwargs):
-        return client
-
-    monkeypatch.setattr(auth_manager.httpx, "AsyncClient", factory)
+    patch_upstream_client(monkeypatch, client)
     return client
 
 

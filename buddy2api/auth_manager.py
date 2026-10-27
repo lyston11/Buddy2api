@@ -27,7 +27,7 @@ import buddy2api.database as db
 import buddy2api.fingerprint as fingerprint
 import buddy2api.sites as sites
 import buddy2api.wb_at_rest as wb_at_rest
-from buddy2api.upstream_transport import transport_for
+from buddy2api.upstream_transport import client_scope
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
@@ -470,9 +470,7 @@ async def probe_account_credentials(account: dict) -> tuple[str, str]:
     headers = build_billing_headers(_fingerprint_account(account))
     url = f"{backend_url_for(account)}/v2/billing/meter/get-user-resource"
     try:
-        async with httpx.AsyncClient(
-            timeout=request_timeout(15), transport=transport_for(account)
-        ) as c:
+        async with client_scope(account, request_timeout(15)) as c:
             r = await c.post(url, headers=headers, json={})
     except httpx.HTTPError as exc:
         return "unknown", f"network error: {str(exc)[:120]}"
@@ -1017,9 +1015,7 @@ async def refresh_token(account: dict) -> bool:
         url = f"{backend_url_for(account)}/v2/plugin/auth/token/refresh"
 
         try:
-            async with httpx.AsyncClient(
-                timeout=request_timeout(15), transport=transport_for(account)
-            ) as c:
+            async with client_scope(account, request_timeout(15)) as c:
                 r = await c.post(url, headers=headers, json={})
             data = r.json()
         except (httpx.HTTPError, ValueError) as e:
@@ -1344,9 +1340,7 @@ async def fetch_account_resources(
         )
 
     try:
-        async with httpx.AsyncClient(
-            timeout=request_timeout(25), transport=transport_for(account)
-        ) as c:
+        async with client_scope(account, request_timeout(25)) as c:
             r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/get-user-resource", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
@@ -1470,9 +1464,7 @@ async def fetch_checkin_status(
         )
 
     try:
-        async with httpx.AsyncClient(
-            timeout=request_timeout(20), transport=transport_for(account)
-        ) as c:
+        async with client_scope(account, request_timeout(20)) as c:
             r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
@@ -1533,9 +1525,7 @@ async def claim_daily_checkin(account: dict) -> dict:
         )
 
     try:
-        async with httpx.AsyncClient(
-            timeout=request_timeout(30), transport=transport_for(fresh)
-        ) as c:
+        async with client_scope(fresh, request_timeout(30)) as c:
             r = await c.post(f"{backend_url_for(fresh)}/v2/billing/meter/daily-checkin", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
