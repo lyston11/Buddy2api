@@ -1147,3 +1147,84 @@ def test_auto_compares_unit_price_not_request_counts():
     auth_manager.forget_cost_profile()
 
     assert auth_manager.preferred_site_for("m") == sites.SITE_INTERNATIONAL
+
+
+# ---------------------------------------------------------------- 权重的语义
+#
+# 权重是「按比例分流」（权重 3 承担 3 倍流量），不是「第二个优先级」。
+# 曾经排序键里有 `-weight`，它排在负载之前，导致权重大的账号永远排第一、负载
+# 根本轮不到比较：实测同优先级、权重 3:1 时 80 次请求全给权重 3 的账号。
+
+def test_weight_splits_traffic_proportionally():
+    a = _make_account("a", "www.workbuddy.ai")
+    b = _make_account("b", "www.workbuddy.ai")
+    db.update_account(a, {"weight": 3})
+    db.update_account(b, {"weight": 1})
+    auth_manager.record_account_models(a, ["m"])
+    auth_manager.record_account_models(b, ["m"])
+
+    counts = {"a": 0, "b": 0}
+    for _ in range(80):
+        picked = auth_manager.pick_account(model="m")
+        counts[picked["name"]] += 1
+        _serve(picked["id"], 1)
+
+    # 3:1 → 期望 60:20，允许粘性带来的少量偏差
+    assert 52 <= counts["a"] <= 66, counts
+    assert 14 <= counts["b"] <= 28, counts
+    assert counts["a"] > counts["b"] * 2
+
+
+def test_priority_still_wins_over_weight():
+    """优先级是分档，档位高的独占 —— 权重不能推翻它。"""
+    high = _make_account("high", "www.workbuddy.ai")
+    low = _make_account("low", "www.workbuddy.ai")
+    db.update_account(high, {"priority": 5, "weight": 1})
+    db.update_account(low, {"priority": 0, "weight": 100})
+    auth_manager.record_account_models(high, ["m"])
+    auth_manager.record_account_models(low, ["m"])
+
+    for _ in range(20):
+        picked = auth_manager.pick_account(model="m")
+        assert picked["id"] == high
+
+
+def test_expiring_quota_beats_weight_within_same_priority():
+    """同优先级下，积分快到期优先于权重 —— 到期那批独吞，权重只在批内分流。"""
+    soon = _make_account("soon", "www.workbuddy.cn")
+    late = _make_account("late", "www.workbuddy.cn")
+    db.update_account(soon, {"weight": 1})
+    db.update_account(late, {"weight": 10})
+    auth_manager.record_account_models(soon, ["m"])
+    auth_manager.record_account_models(late, ["m"])
+    _seed_billing(soon, "m", unit_price=0.5)
+    _seed_billing(late, "m", unit_price=0.5)
+    _seed_expiring(soon, amount=1000, days=1)
+    _seed_expiring(late, amount=1000, days=25)
+
+    picked = auth_manager.pick_account(model="m")
+    assert picked["id"] == soon, "快到期的应该压过权重 10 的账号"
+
+
+def test_weight_splits_within_the_urgent_expiry_batch():
+    """同批到期紧急的账号之间，权重才按比例生效。"""
+    a = _make_account("a", "www.workbuddy.cn")
+    b = _make_account("b", "www.workbuddy.cn")
+    late = _make_account("late", "www.workbuddy.cn")
+    db.update_account(a, {"weight": 1})
+    db.update_account(b, {"weight": 3})
+    for aid in (a, b, late):
+        auth_manager.record_account_models(aid, ["m"])
+        _seed_billing(aid, "m", unit_price=0.5)
+    _seed_expiring(a, amount=1000, days=1)
+    _seed_expiring(b, amount=1000, days=1)
+    _seed_expiring(late, amount=1000, days=25)
+
+    counts = {"a": 0, "b": 0, "late": 0}
+    for _ in range(80):
+        picked = auth_manager.pick_account(model="m")
+        counts[picked["name"]] += 1
+        _serve(picked["id"], 1)
+
+    assert counts["late"] == 0, "到期晚的不该分到流量"
+    assert counts["b"] > counts["a"] * 2, counts

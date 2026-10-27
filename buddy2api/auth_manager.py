@@ -1819,10 +1819,16 @@ def _route_load(account: dict, loads: Optional[dict[int, int]] = None) -> float:
 
 
 def _route_sort_key(account: dict, loads: Optional[dict[int, int]] = None):
-    weight = _route_weight(account)
+    """同档候选的排序键：优先级 → 权重归一后的负载 → id。
+
+    这里**刻意没有 `-weight`**：权重的作用是「按比例分流」（权重 3 承担 3 倍流量），
+    而 `_route_load` 已经是 `窗口内请求数 / 权重`，权重的影响全在那一项里。再补一个
+    `-weight` 会把权重变成「谁大谁永远排第一」的强序，负载根本轮不到比较 ——
+    实测（两个同优先级账号，权重 3:1，连打 80 次）：加 `-weight` 时 80:0，
+    去掉之后才是 60:20。也就是说那个 `-weight` 让权重退化成第二个优先级。
+    """
     return (
         -_route_priority(account),
-        -weight,
         _route_load(account, loads),
         _route_int(account.get("id"), 0),
     )
