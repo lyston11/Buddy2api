@@ -50,6 +50,11 @@ _account_failures: dict[int, tuple[int, float]] = {}
 # 模型暂时没额度」，不影响该账号服务其它模型；后者是账号级别的失败退避。
 _rate_limit_lock = threading.Lock()
 _model_rate_limits: dict[tuple[int, str], float] = {}
+# 账号级「长期不可用」：账号 id → (上游业务码, 原因, 冷却截止 monotonic)。
+# 与 _account_failures 分开存：那边是瞬时抖动退避（秒到分钟级），这里是
+# 「这个号现在不能用」（小时级），而且要让管理页和选路都能直接看到原因。
+_account_unavailable_lock = threading.Lock()
+_account_unavailable: dict[int, tuple[int, str, float]] = {}
 
 # 429（WorkBuddy code 6004「使用量已超出频率限制」）不是瞬时抖动，而是额度用尽：
 # 上游报文明确说「您也可以切换其他模型继续使用」。实测 2026-09-20：
@@ -65,6 +70,29 @@ _model_rate_limits: dict[tuple[int, str], float] = {}
 RATE_LIMIT_COOLDOWN_SECONDS = int(
     os.environ.get("CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS", "900")
 )
+
+# 上游「这个账号本身不能用」的业务码（HTTP status 不可靠，必须看 error.data.code）：
+#   14017 The trial version is not yet activated   试用未激活（要重新登录激活）
+#   14018 Credits exhausted                        积分耗尽
+#   11140 request illegal                          账号级风控/授权封禁
+#   11141 / 11142                                  与 11140 同类，官方客户端一并归为「需重新登录」
+# 这些和 429 限流有本质区别：限流是「这个模型暂时没额度、换模型还能用」，它们是
+# 「这个账号现在谁都不给用」。按限流处理（900s 模型冷却）会让账号冷却一过就以
+# 「零负载」身份回到候选池最前面，继续白跑 —— 2026-09-25 账号 sunnylw1109 就是这样
+# 每 15 分钟被派一次活、连打 40 次 14017；2026-09-26 四个账号吃 11140 后同样被反复
+# 重试了 925 次。所以给它们独立的、长得多的冷却。
+ACCOUNT_UNAVAILABLE_CODES = {
+    14017: "trial_not_activated",
+    14018: "credits_exhausted",
+    11140: "request_illegal",
+    11141: "auth_blocked",
+    11142: "auth_blocked",
+}
+# 有长期不可用原因时的冷却时长（默认 6 小时，指数退避封顶 24 小时）。
+ACCOUNT_UNAVAILABLE_COOLDOWN_SECONDS = int(
+    os.environ.get("CB_GATEWAY_ACCOUNT_UNAVAILABLE_COOLDOWN_SECONDS", str(6 * 3600))
+)
+ACCOUNT_UNAVAILABLE_COOLDOWN_MAX_SECONDS = 24 * 3600
 
 # 换号重试的账号数上限。必须大于「可用账号数」才能保证轮到健康账号：
 # 3 个账号时试 3 个够用，但 6 个账号时限额账号会先把 3 次机会占满。
@@ -406,6 +434,77 @@ def account_model_rate_limited(aid: int, model) -> bool:
         return True
 
 
+def account_unavailable_reason(aid: int) -> Optional[str]:
+    """账号当前是否处于「长期不可用」冷却中，返回原因短语（不在冷却里返回 None）。"""
+    with _account_unavailable_lock:
+        entry = _account_unavailable.get(aid)
+        if not entry:
+            return None
+        code, reason, deadline = entry
+        if deadline <= time.monotonic():
+            _account_unavailable.pop(aid, None)
+            return None
+        return f"{reason}(code={code})"
+
+
+def clear_all_account_unavailable() -> None:
+    """清空全部长期不可用标记（测试与「全部恢复」排障用）。"""
+    with _account_unavailable_lock:
+        _account_unavailable.clear()
+
+
+def clear_account_unavailable(aid: int) -> None:
+    """清掉长期不可用标记（刷新 token 成功、人工启用、探活恢复时调用）。"""
+    with _account_unavailable_lock:
+        _account_unavailable.pop(aid, None)
+
+
+def account_unavailable_snapshot() -> dict[int, dict]:
+    """给管理页用的快照：账号 id → {code, reason, seconds_left}。"""
+    now = time.monotonic()
+    out: dict[int, dict] = {}
+    with _account_unavailable_lock:
+        for aid, (code, reason, deadline) in list(_account_unavailable.items()):
+            if deadline <= now:
+                _account_unavailable.pop(aid, None)
+                continue
+            out[aid] = {
+                "code": code,
+                "reason": reason,
+                "seconds_left": int(deadline - now),
+            }
+    return out
+
+
+def mark_account_unavailable(
+    aid: int, code: int, reason: Optional[str] = None
+) -> Optional[str]:
+    """给账号打上「上游明确说这个号不能用」的长冷却（不是限流）。
+
+    返回原因短语；不认识的上游码返回 None（调用方照旧走瞬时退避）。
+    """
+    known = ACCOUNT_UNAVAILABLE_CODES.get(code)
+    if not known:
+        return None
+    label = reason or known
+    now = time.monotonic()
+    with _account_unavailable_lock:
+        previous = _account_unavailable.get(aid)
+        hits = 0 if not previous else 1
+        # 连续命中同一类不可用时按倍数退避（最长 24h），首次 6h
+        cooldown = min(
+            ACCOUNT_UNAVAILABLE_COOLDOWN_MAX_SECONDS,
+            ACCOUNT_UNAVAILABLE_COOLDOWN_SECONDS * (2 ** hits),
+        )
+        _account_unavailable[aid] = (code, label, now + cooldown)
+    print(
+        f"[auth_manager] 账号 {aid} 上游标记为不可用（{label}，code={code}），"
+        f"冷却 {int(cooldown // 60)} 分钟",
+        file=sys.stderr,
+    )
+    return label
+
+
 def mark_account_failure(aid: int, status_code: int = 0, model: Optional[str] = None):
     # 限流是模型级的（上游提示「可切换其他模型继续使用」）：只给这个模型打冷却，
     # 账号本身是好的，不记账号级失败 —— 否则该账号在其它模型上的正常服务也会被堵住。
@@ -503,6 +602,7 @@ async def verify_account_credentials(aid: int) -> dict:
     result, detail = await probe_account_credentials(account)
     if result == "ok":
         _reset_auth_failure(aid)
+        clear_account_unavailable(aid)
         print(
             f"[auth_manager] 账号 {aid} 连续鉴权失败后复核通过（{detail}），保持 active",
             file=sys.stderr,
@@ -1054,6 +1154,7 @@ async def refresh_token(account: dict) -> bool:
         }
         db.update_account(aid, update_data)
         _reset_auth_failure(aid)
+        clear_account_unavailable(aid)
         return True
 
 
@@ -1848,6 +1949,8 @@ def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str, model: 
     """
     if aid in exclude_ids or account_is_cooling_down(aid):
         return None
+    if account_unavailable_reason(aid):
+        return None
     target = db.get_account(aid)
     if not target:
         return None
@@ -1903,6 +2006,7 @@ def pick_account(
         a for a in accounts
         if a["id"] not in exclude_ids
         and not account_is_cooling_down(a["id"])
+        and not account_unavailable_reason(a["id"])
         and not is_route_excluded(a)
     ]
     if not candidates:

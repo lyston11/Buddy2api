@@ -202,14 +202,19 @@ def _plan_retry(
     max_attempts: int,
     link_failures: int,
     model_blocked: bool = False,
+    account_unavailable: bool = False,
 ) -> tuple[bool, int]:
     """这一轮失败后要不要再换一个账号试，并返回更新后的链路级失败计数。
 
     账号级故障（401/403/429）换号就是解法，用满账号池额度；链路级故障
     （5xx/408/409/425）换号换不掉，只给 LINK_LEVEL_MAX_ATTEMPTS 次；「这个账号
     服务不了这个模型」不是账号故障，但换号同样有效，不占链路额度。
+
+    `account_unavailable` 是上游明确说「这个号现在不能用」（14017/14018/11140…）：
+    换号有效、额度用满账号池，同样不占链路额度 —— 它和 model_blocked 一样是
+    「换个人就行」，只是被换掉的那个账号要吃长冷却。
     """
-    if model_blocked:
+    if model_blocked or account_unavailable:
         return attempt < max_attempts - 1, link_failures
     if not _is_retryable_status(status):
         return False, link_failures
@@ -300,6 +305,35 @@ def _model_unavailable_error(status: int, detail) -> bool:
     if node.get("code") == _MODEL_UNAVAILABLE_CODE:
         return True
     return str(node.get("msg") or node.get("message") or "").startswith("model [")
+
+
+def _upstream_error_code(detail) -> int:
+    """从上游错误体里取业务码（`error.data.code`，退化为 `error.code` / 顶层 code）。
+
+    上游把真正的判定放在这个字段里，HTTP status 只是粗粒度包装：14017/14018 都是
+    429，11140 是 403，11102 是 400 —— 只看 status 会把「账号废了」和「限流了」
+    混成一件事（见 auth_manager.ACCOUNT_UNAVAILABLE_CODES 的注释）。
+    """
+    if not isinstance(detail, dict):
+        return 0
+    node = detail.get("error")
+    if isinstance(node, dict):
+        data = node.get("data")
+        if isinstance(data, dict) and isinstance(data.get("code"), int):
+            return data["code"]
+        if isinstance(node.get("code"), int):
+            return node["code"]
+    if isinstance(detail.get("code"), int):
+        return detail["code"]
+    return 0
+
+
+def _account_unavailable_code(status: int, detail) -> int:
+    """上游是否明确说「这个账号本身不能用」，是则返回它的业务码。"""
+    code = _upstream_error_code(detail)
+    if code in auth_manager.ACCOUNT_UNAVAILABLE_CODES:
+        return code
+    return 0
 
 
 # 上游的渠道校验：认为「这次请求不是官方客户端发出的」时的业务码。实测两种文案，
@@ -1303,15 +1337,20 @@ async def _json_chat_with_stall_retry(
         # 模型不属于这个账号的站点：换号就能成功，别把账号记成故障（它本身是好的），
         # 但要记住「这个账号服务不了这个模型」，下次直接跳过、不再浪费一次往返。
         model_blocked = _model_unavailable_error(err_status, detail)
+        unavailable_code = _account_unavailable_code(err_status, detail)
         if channel_blocked:
             # 换过身份还是被渠道校验拒：这是网关侧的头/体问题，不该让账号背锅。
             pass
         elif model_blocked:
             auth_manager.mark_model_denied(account["id"], body.get("model"))
+        elif unavailable_code:
+            # 上游明确说这个账号不能用（见 auth_manager.ACCOUNT_UNAVAILABLE_CODES）
+            auth_manager.mark_account_unavailable(account["id"], unavailable_code)
         else:
             auth_manager.mark_account_failure(account["id"], err_status, body.get("model"))
         will_retry, link_failures = _plan_retry(
-            err_status, attempt, max_retries, link_failures, model_blocked
+            err_status, attempt, max_retries, link_failures, model_blocked,
+            bool(unavailable_code),
         )
         error_message = detail
         if isinstance(detail, dict):
@@ -1617,12 +1656,25 @@ async def _stream_upstream(
                         model_blocked = _model_unavailable_error(
                             response.status_code, detail
                         )
+                        unavailable_code = _account_unavailable_code(
+                            response.status_code, detail
+                        )
                         if channel_blocked:
                             # 换过身份仍被拒：网关侧的头/体问题，不给账号记失败。
                             failure = FAILURE_CHANNEL
                             last_failure = FAILURE_CHANNEL
                         elif model_blocked:
                             auth_manager.mark_model_denied(
+                                account["id"], body.get("model")
+                            )
+                        elif unavailable_code:
+                            # 上游明确说这个账号不能用（试用未激活 / 积分耗尽 /
+                            # 账号级风控封禁）：打长冷却，别当限流那样 15 分钟就
+                            # 重新派活（见 auth_manager.ACCOUNT_UNAVAILABLE_CODES）。
+                            auth_manager.mark_account_unavailable(
+                                account["id"], unavailable_code
+                            )
+                            auth_manager.clear_model_rate_limit(
                                 account["id"], body.get("model")
                             )
                         else:
@@ -1635,6 +1687,7 @@ async def _stream_upstream(
                             will_retry, link_failures = _plan_retry(
                                 response.status_code, attempt, max_attempts,
                                 link_failures, model_blocked,
+                                bool(unavailable_code),
                             )
                         if will_retry:
                             pending_retry_log = {

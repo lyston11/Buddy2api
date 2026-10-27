@@ -320,6 +320,22 @@ Keep `--host 127.0.0.1`. Do not share the database, auth folders, or key screens
 
 Decrypting a WorkBuddy AI desktop `$wbEncrypted` envelope yields the **plaintext token**, exactly as sensitive as reading the auth file directly; the key (`CB_GATEWAY_WB_AT_REST_KEY`) grants the same read access. Do not share it.
 
+## Telling a banned account from a throttled one
+
+Every "this account is unusable" verdict lives in upstream's `error.data.code`; the HTTP status is only a coarse wrapper (`14017`/`14018` arrive as 429, `11140` as 403), so looking at the status alone mixes "dead account" with "rate limited":
+
+| Code | Meaning | Gateway behaviour |
+| --- | --- | --- |
+| `14017` | trial not activated, sign in again | account-level cooldown (6h default, doubles per hit, capped at 24h) |
+| `14018` | credits exhausted | same |
+| `11140` / `11141` / `11142` | account-level risk/auth ban (the official client treats these as "sign in again") | same |
+| `429` + `6004` | real throttling (another model still works) | per account+model 900s cooldown only |
+| `11102` | this account's site has no such model | `model_denied`; switch accounts, no account failure recorded |
+
+Account-level unavailability shows up in `/admin/accounts` as `unavailable_reason` / `unavailable_code` / `unavailable_seconds_left` and is rendered in the status column; such accounts are skipped while cooling down. A successful token refresh or credential re-check clears the flag.
+
+To investigate, run `python scripts/account_probe.py`: it sends one minimal request per account and reports the verdict by business code (`--id 9` for one account, `--json` for monitoring, `--mark` to apply the cooldown).
+
 ## License
 
 MIT

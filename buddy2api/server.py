@@ -582,9 +582,17 @@ async def admin_credit_summary(
 async def admin_list_accounts(authorization: str | None = Header(default=None)):
     _check_admin(authorization)
     accounts = db.list_accounts()
+    # 上游明确判定「这个号不能用」的长冷却原因（14017 试用未激活 / 14018 积分耗尽 /
+    # 11140 风控封禁…）。放在账号列表里，封号当天就能在管理页看到，不用翻日志。
+    unavailable = auth_manager.account_unavailable_snapshot()
     result = []
     for a in accounts:
         s = auth_manager.get_account_status(a)
+        blocked = unavailable.get(int(a["id"]))
+        if blocked:
+            s["unavailable_reason"] = blocked["reason"]
+            s["unavailable_code"] = blocked["code"]
+            s["unavailable_seconds_left"] = blocked["seconds_left"]
         s["phone"] = a.get("phone", "")
         s["account_type"] = a.get("account_type", "")
         s["enterprise_id"] = a.get("enterprise_id", "")

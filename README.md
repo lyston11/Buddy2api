@@ -368,6 +368,22 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_GATEWAY_USER_AGENT` | 整体覆盖 WorkBuddy 出站 User-Agent，默认按当前身份自拼 |
 | `CB_GATEWAY_QIMEI36` | 覆盖出站 `X-Device-Id-List` 里的 qimei36；默认读客户端缓存文件，读不到就用官方自带的 qimei SDK 现算并落盘到 `.debug/qimei36.json`，`off` 可摘掉这个头 |
 
+## 账号被封怎么判断
+
+上游的「这个号不能用」全部放在 `error.data.code` 里，HTTP status 只是粗包装（`14017`/`14018` 是 429、`11140` 是 403），所以**只看 status 会把「号废了」和「限流了」混成一件**：
+
+| 业务码 | 含义 | 网关处理 |
+| --- | --- | --- |
+| `14017` | 试用未激活，需重新登录激活 | 账号级长冷却（默认 6h，连续命中翻倍，封顶 24h） |
+| `14018` | 积分耗尽 | 同上 |
+| `11140` / `11141` / `11142` | 账号级风控/授权封禁（官方客户端也归为「需重新登录」） | 同上 |
+| `429` + `6004` | 真·限流（换模型还能用） | 只冷却「账号 × 模型」900s |
+| `11102` | 该账号站点没有这个模型 | 记 `model_denied`，换号即可，不给账号记失败 |
+
+账号级不可用会写进 `/admin/accounts` 的 `unavailable_reason` / `unavailable_code` / `unavailable_seconds_left`，管理页状态列直接显示，冷却期内不参与选路。刷新 token 成功或复核通过会自动清掉。
+
+排查用 `python scripts/account_probe.py`：逐个账号真发一条最小请求，按业务码给出结论（`--id 9` 只看某个号，`--json` 给监控用，`--mark` 顺手打冷却）。
+
 ## 数据和安全
 
 - 账号 Token 写入前会加密。Windows 用系统 DPAPI。

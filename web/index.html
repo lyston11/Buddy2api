@@ -746,7 +746,7 @@ const app=createApp({
       <div class="card">
         <div class="card-h">账号状态<span class="sub">最多 5 个</span></div>
         <table class="mini-table" v-if="s.account_stats?.length"><thead><tr><th>账号</th><th>状态</th><th>请求</th><th>最近</th></tr></thead><tbody>
-          <tr v-for="a in s.account_stats" :key="a.id"><td style="font-weight:600">{{a.nickname||a.name||'-'}}</td><td><span class="badge" :class="a.status">{{a.status}}</span></td><td>{{n(a.total_requests)}}</td><td class="mono">{{fmt(a.last_used_at)}}</td></tr>
+          <tr v-for="a in s.account_stats" :key="a.id"><td style="font-weight:600">{{a.nickname||a.name||'-'}}</td><td><span class="badge" :class="a.status">{{a.status}}</span><div class="cache-note" v-if="a.unavailable_reason" :title="'上游拒绝码 '+a.unavailable_code+'，'+Math.round((a.unavailable_seconds_left||0)/60)+' 分钟后重试'"><span class="badge expired" style="margin-top:4px">不可用</span> {{a.unavailable_reason}}</div></td><td>{{n(a.total_requests)}}</td><td class="mono">{{fmt(a.last_used_at)}}</td></tr>
         </tbody></table>
         <div class="empty" v-else>暂无账号</div>
       </div>
