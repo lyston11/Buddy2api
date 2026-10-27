@@ -211,10 +211,13 @@ def test_device_headers_follow_client_and_skip_missing_qimei(monkeypatch, tmp_pa
         "qimei36": "c918e83b51bc0186deabc42c200015e1a111"
     }
 
-    # 读不到缓存（国际版客户端今天就是 cache miss）就不发这个头
+    # 缓存文件没了、SDK 也还没算出来（首次启动那一小段）就先不发这个头
     monkeypatch.setitem(
         fingerprint._QIMEI_CACHE_FILES, "domestic", str(tmp_path / "missing.json")
     )
+    monkeypatch.setattr(fingerprint, "_QIMEI_RUNTIME", {})
+    monkeypatch.setattr(fingerprint, "_QIMEI_CACHE_PATH", tmp_path / "qimei36.json")
+    monkeypatch.setattr(fingerprint, "_kick_off_qimei_detection", lambda _group: None)
     fingerprint._qimei_from_file.cache_clear()
     assert "x-device-id-list" not in fingerprint.chat_headers(ACCOUNT)
 
@@ -230,3 +233,59 @@ def test_billing_and_refresh_headers_are_lowercase_and_scoped():
     _assert_lowercase_names(refresh)
     assert refresh["x-refresh-token"] == "refresh-1"
     assert refresh["authorization"] == "Bearer tok"
+
+
+def test_international_site_resolves_qimei_via_bundled_sdk(monkeypatch, tmp_path):
+    """国际版 product.json 没有 appKey，靠官方 SDK 现算设备标识。
+
+    实测（把 HOME 指到空目录、用国内版 appKey 跑国际版自带的 helper）返回的仍是这台
+    机器原来那个 qimei36 —— 说明它是设备级 id，用哪款客户端的 appKey 算都一样。
+    """
+    monkeypatch.delenv("CB_GATEWAY_QIMEI36", raising=False)
+    monkeypatch.setattr(fingerprint, "_QIMEI_RUNTIME", {})
+    monkeypatch.setattr(fingerprint, "_QIMEI_PENDING", set())
+    monkeypatch.setattr(fingerprint, "_QIMEI_CACHE_PATH", tmp_path / "qimei36.json")
+
+    calls = []
+
+    def fake_helper(app_dir, stamp):
+        calls.append(app_dir)
+        return "c918e83b51bc0186deabc42c200015e1a111"
+
+    monkeypatch.setattr(fingerprint, "_qimei_from_helper", fake_helper)
+    monkeypatch.setitem(
+        fingerprint._QIMEI_CACHE_FILES, "international", str(tmp_path / "missing.json")
+    )
+
+    # 同步跑一次探测（正常路径是后台线程，这里直接调同一个函数）
+    value = fingerprint.detect_qimei_via_sdk("international")
+    assert value == "c918e83b51bc0186deabc42c200015e1a111"
+    # 先试国际版那款客户端
+    assert calls[0] == fingerprint._MAC_APP_BUNDLES[fingerprint.sites.SITE_INTERNATIONAL]
+
+
+def test_qimei_off_switch_and_env_override(monkeypatch):
+    monkeypatch.setattr(fingerprint, "_QIMEI_RUNTIME", {})
+    monkeypatch.setenv("CB_GATEWAY_QIMEI36", "deadbeef" * 4 + "dead")
+    assert fingerprint.chat_headers(ACCOUNT)["x-device-id-list"].startswith('{"qimei36":"deadbeef')
+    monkeypatch.setenv("CB_GATEWAY_QIMEI36", "off")
+    fingerprint.begin_request(None)
+    assert "x-device-id-list" not in fingerprint.chat_headers(ACCOUNT)
+
+
+def test_qimei_persisted_value_is_reused_without_spawning(monkeypatch, tmp_path):
+    """算过一次就落盘，重启后直接读，不再 spawn SDK。"""
+    cache = tmp_path / "qimei36.json"
+    cache.write_text('{"international": "c918e83b51bc0186deabc42c200015e1a111"}', encoding="utf-8")
+    monkeypatch.delenv("CB_GATEWAY_QIMEI36", raising=False)
+    monkeypatch.setattr(fingerprint, "_QIMEI_RUNTIME", {})
+    monkeypatch.setattr(fingerprint, "_QIMEI_CACHE_PATH", cache)
+    monkeypatch.setitem(
+        fingerprint._QIMEI_CACHE_FILES, "international", str(tmp_path / "missing.json")
+    )
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("有落盘缓存时不该再跑 SD")
+
+    monkeypatch.setattr(fingerprint, "_kick_off_qimei_detection", boom)
+    assert fingerprint.qimei36("www.workbuddy.ai") == "c918e83b51bc0186deabc42c200015e1a111"

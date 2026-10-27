@@ -18,7 +18,7 @@
 | 消息 id | uuid4 hex | uuid7 hex | uuid7 hex |
 | `x-conversation-request-id` | 每条 HTTP 一个 | 一轮 prompt 一个 | 一轮 prompt 一个 |
 | `x-userinfo` | 不发 | 企业账号发 | `base64(JSON{uin,owner_uin,…})` |
-| `x-device-id-list` | 不发 | 有本机 qimei 就发 | `{"qimei36":…}` |
+| `x-device-id-list` | 不发 | 两个站点都发（见下节） | `{"qimei36":…}` |
 | 连接 | 每个请求新建客户端（新 TCP+TLS） | 共享 keep-alive 客户端 | `https.Agent({keepAlive:true})` |
 | Cookie | httpx 自带 jar | 空 jar（永不发 Cookie） | 无 jar |
 
@@ -47,16 +47,38 @@
   `base64(JSON{uin, owner_uin, id_source, token_source})`。
 - **设备头**：`main/module.app-server.js` 的 `AuthStateHeaderProvider` 固定发
   `X-Custom-Channel-Id: unknown`，有 qimei 时再发
-  `X-Device-Id-List: {"qimei36":…}`。qimei 来自客户端自己的缓存
-  （国内版 `~/.workbuddy/qimei-cache.json`）；国际版今天是 cache miss，所以国际账号
-  本来就不带这个头 —— 网关按站点分开读，读不到就不发，不编造。
+  `X-Device-Id-List: {"qimei36":…}`。qimei 的来源见下一节。
 - **`X-No-*` 取值**：`main/code-cache.js` 里是 `"X-No-User-Id": "true"`（不是 `1`）。
+
+## qimei36（`X-Device-Id-List`）从哪来
+
+国内版客户端自己算：`main/log-acl-guard.js` 里的 `QimeiDetector` 从
+`app.asar.unpacked/cli/product.json` 读 `config.qimei36AppKey.darwin`，spawn
+`main/qimei-helper.js`（`@tencent/qimei-node` + macOS framework），把结果写进
+`~/.workbuddy/qimei-cache.json`。
+
+国际版**没有这一步**：它的 `product.json` 里根本没有 `qimei36AppKey`，日志每天都是
+`[QimeiDetector] appKey missing, skip`，所以永远不会生成缓存文件 —— 也就是说真实的
+国际版客户端发出的请求里本来就没有这个头。但要发也不是没法发：
+
+- qimei36 是**设备级** id。实测：把 `HOME` 指到空目录、用国内版 appKey 跑**国际版自带
+  的** `main/qimei-helper.js`，返回的仍是这台机器原来那个 `c918e83b…`，与国内版缓存
+  文件里的值完全一致。也就是说 appKey 只影响 SDK 初始化，设备号本身跟产品无关。
+- 所以 `fingerprint.qimei36()` 的解析顺序是：`CB_GATEWAY_QIMEI36` 覆盖 →
+  站点客户端缓存文件 → 网关自己的落盘缓存（`.debug/qimei36.json`）→
+  **用官方自带的 helper + 任意一款客户端的 appKey 现算**（国际版缺 key 就用国内版的）。
+  拿到的都是这台机器真实的 Turing 设备号，不是编出来的字符串。
+- 现算走后台线程、8s 超时：组装请求头是同步路径，不能为了一个头把事件循环卡住；
+  刚启动、还没算出来的那几条请求会像官方客户端 backfill 之前一样不带这个头，
+  之后（以及之后所有进程，因为结果已落盘）都会带上。
+- 排障开关：`CB_GATEWAY_QIMEI36=off` 整个摘掉这个头；
+  `python scripts/fingerprint_probe.py --qimei` 看两个站点各自解析到哪一步。
 
 ## 代码落点
 
 - `buddy2api/fingerprint.py`：uuid7 生成器、会话 id 缓存（uuid7，按会话稳定）、
   一轮 prompt 的 request id（ContextVar）、全小写且按官方拼装顺序插入的头、
-  `x-userinfo` / `x-no-*` / 设备头。
+  `x-userinfo` / `x-no-*` / 设备头、qimei36 的多级解析（缓存文件 → 落盘 → 官方 SDK 现算）。
 - `buddy2api/upstream_transport.py`：`NODE_DEFAULT_CIPHERS` + `build_ssl_context()`
   （`_NoAlpnContext` 把 httpcore 的 `set_alpn_protocols` 变成 no-op）、
   `build_client()` / `shared_client()`（共享 keep-alive 客户端、摘掉 httpx 默认头、
@@ -98,6 +120,7 @@ python/httpx/axios 自报 UA 这些项钉死；`tests/test_fingerprint_headers.p
 同一天用改后的头对真上游各发一条最小流式请求（不经过网关进程，直接走新代码路径）：
 
 - 国际站（`www.workbuddy.ai`）：`200`，回包首行 `: heartbeat`（桌面流水线）；
+- 国际站 + 现算出来的 `x-device-id-list`（补上国际版客户端自己缺的那一步）：`200`；
 - 国际站 + `CB_GATEWAY_CHANNEL=cli`：`200`，无 heartbeat（CLI 流水线，渠道切换兜底可用）；
 - 国内站（`www.workbuddy.cn`，带本机 qimei 的 `x-device-id-list`）：`200`。
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -49,8 +50,16 @@ def main(argv: list[str] | None = None) -> int:
         help="要自检的身份 profile（默认 app）",
     )
     parser.add_argument("--json", action="store_true", help="输出 JSON")
+    parser.add_argument(
+        "--qimei",
+        action="store_true",
+        help="只查两个站点的 qimei36（设备标识）解析结果，不发请求",
+    )
     parser.add_argument("--domain", default=ACCOUNT["domain"], help="账号域名（决定版本号）")
     args = parser.parse_args(argv)
+
+    if args.qimei:
+        return probe_qimei()
 
     account = dict(ACCOUNT, domain=args.domain)
     fingerprint.begin_request(None)
@@ -93,6 +102,29 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print("[ok] 与官方客户端一致")
     return 0
+
+
+def probe_qimei() -> int:
+    """两个站点各自的 qimei36 解析结果（缓存文件 / 落盘缓存 / 官方 SDK 现算）。"""
+    ok = True
+    for group, domain in (
+        ("international", "www.workbuddy.ai"),
+        ("domestic", "www.workbuddy.cn"),
+    ):
+        cached_file = fingerprint._QIMEI_CACHE_FILES.get(group, "")
+        used_file = os.path.exists(os.path.expanduser(cached_file)) if cached_file else False
+        value = fingerprint.qimei36(domain)
+        if value is None:
+            # 现算走后台线程，这里同步跑一次给 CLI 用
+            value = fingerprint.detect_qimei_via_sdk(group)
+            source = "sdk"
+        else:
+            source = "client-cache" if used_file else "gateway-cache"
+        print(f"{group:14s} {domain:20s} {value or '(不可用)'}  [{source}]")
+        ok = ok and bool(value)
+    if not ok:
+        print("\n拿不到 qimei36 时网关不会发 x-device-id-list（与官方客户端行为一致）")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

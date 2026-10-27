@@ -77,6 +77,8 @@ import os
 import platform
 import plistlib
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -86,6 +88,7 @@ from functools import lru_cache
 from typing import Optional
 
 import buddy2api.sites as sites
+from buddy2api.paths import PROJECT_ROOT
 
 # 桌面端 / CLI 版本：优先读本机装的官方客户端，读不到才用这两个回退值。
 # 2026-10-24 的实测值（WorkBuddy AI 5.7.6 + 内置 CLI 2.156.0）。
@@ -123,6 +126,13 @@ CHANNELS = (CHANNEL_APP, CHANNEL_CLI)
 _DEFAULT_CHANNEL = CHANNEL_APP
 
 _DISABLED_VALUES = {"off", "none", "false", "0", ""}
+
+# qimei36 现算：进程内缓存 + 落盘缓存（`.debug/qimei36.json`）+ 一次性后台探测。
+_QIMEI_RUNTIME: dict[str, str] = {}
+_QIMEI_PENDING: set[str] = set()
+_QIMEI_LOCK = threading.Lock()
+_QIMEI_CACHE_PATH = PROJECT_ROOT / ".debug" / "qimei36.json"
+_QIMEI_HELPER_TIMEOUT_SECONDS = 8.0
 
 # 单请求的上下文：渠道覆盖（11128 时切换）、会话 id、本轮 prompt 的 request id。
 # 用 ContextVar 是为了让 auth_manager.build_headers 不必多带参数，同时请求之间互不串味。
@@ -300,26 +310,202 @@ def _qimei_from_file(path: str, stamp: float) -> Optional[str]:
     return value or None
 
 
-def qimei36(domain: Optional[str] = None) -> Optional[str]:
-    """本机官方客户端缓存的 qimei36（设备标识）。
+@lru_cache(maxsize=8)
+def _qimei_from_helper(app_dir: str, stamp: float) -> Optional[str]:
+    """用官方客户端自带的 qimei SDK 现算一次设备标识（结果按 app_dir 缓存）。"""
+    helper = os.path.join(
+        app_dir, "Contents", "Resources", "app.asar.unpacked", "main", "qimei-helper.js"
+    )
+    if not os.path.exists(helper):
+        return None
+    app_key = _product_qimei_app_key(app_dir)
+    if not app_key:
+        return None
+    node = _bundled_node()
+    if not node:
+        return None
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin"),
+        "HOME": os.environ.get("HOME", "/tmp"),
+        "WORKBUDDY_QIMEI_APP_KEY": app_key,
+        "NODE_OPTIONS": "",  # 官方 helper 同样清掉，避免继承调试参数
+    }
+    try:
+        completed = subprocess.run(
+            [node, helper],
+            capture_output=True,
+            timeout=_QIMEI_HELPER_TIMEOUT_SECONDS,
+            env=env,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in reversed(completed.stdout.decode("utf-8", "replace").strip().splitlines()):
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("ok"):
+            value = str(payload.get("qimei36") or "").strip()
+            return value or None
+    return None
 
-    取自客户端自己写的缓存文件；读不到就**不发**这个头 —— 真实客户端在 cache miss
-    时同样不发（国际版今天的日志就是 `qimei36 from cache: miss`），发一个编造的值
-    反而比不发送更像伪造。`CB_GATEWAY_QIMEI36` 可显式覆盖。
+
+def qimei36(domain: Optional[str] = None) -> Optional[str]:
+    """本机 qimei36 设备标识（`X-Device-Id-List: {"qimei36":…}` 的来源）。
+
+    按可靠性依次尝试，都拿不到就不发这个头（真实客户端在拿不到值时同样不发，发一个
+    编造的值反而比不发送更像伪造）：
+
+    1. `CB_GATEWAY_QIMEI36` 显式覆盖（`off`/`none` 用来整个摘掉这个头）；
+    2. 站点客户端自己写的缓存文件（国内版 `~/.workbuddy/qimei-cache.json`）；
+    3. **官方自带的 qimei SDK 现算**（见下）。
+
+    第 3 条是为了国际版：它的 `product.json` 里根本没有 `qimei36AppKey`，客户端日志
+    一直是 `[QimeiDetector] appKey missing, skip`，所以永远不会写缓存文件。但
+    qimei36 是**设备级** id —— 实测把 HOME 指到空目录、用国内版 appKey 跑国际版自带
+    的 helper，返回的仍是这台机器原来那个 `c918e83b…` —— 所以国际版缺 appKey 时回退
+    用另一款客户端 product.json 里的 appKey 现算，拿到的是同一台设备的**真实** Turing
+    设备号，不是编造值；算出来会落到 `.debug/qimei36.json`，后续进程直接用。
+
+    计算走后台线程、超时即放弃：组装请求头是同步路径，不能为了一个头把事件循环卡 1 秒
+    多；刚启动的那几条请求会像官方客户端 backfill 之前一样不带这个头。
     """
     override = (os.environ.get("CB_GATEWAY_QIMEI36") or "").strip()
     if override:
         # off/none/空 用来摘掉这个头（排障时的开关），其余值当显式覆盖
         return None if override.lower() in _DISABLED_VALUES else override
-    template = _QIMEI_CACHE_FILES.get(sites.site_group(domain))
-    if not template:
-        return None
-    path = os.path.expanduser(template)
+    group = sites.site_group(domain)
+    cached = _QIMEI_RUNTIME.get(group)
+    if cached:
+        return cached
+
+    template = _QIMEI_CACHE_FILES.get(group)
+    if template:
+        path = os.path.expanduser(template)
+        try:
+            stamp = os.stat(path).st_mtime
+        except OSError:
+            stamp = None
+        if stamp is not None:
+            value = _qimei_from_file(path, stamp)
+            if value:
+                _QIMEI_RUNTIME[group] = value
+                _persist_qimei(group, value)
+                return value
+
+    persisted = _load_persisted_qimei(group)
+    if persisted:
+        _QIMEI_RUNTIME[group] = persisted
+        return persisted
+
+    _kick_off_qimei_detection(group)  # 后台算一次，这次先不带这个头
+    return None
+
+
+def _persist_qimei(group: Optional[str], value: str) -> None:
+    """把 qimei36 落到 `.debug/qimei36.json`（重启后不必再 spawn 一次 SDK）。"""
     try:
-        stamp = os.stat(path).st_mtime
+        payload = _load_qimei_file()
+        if payload.get(group or "") == value:
+            return
+        payload[group or ""] = value
+        path = _QIMEI_CACHE_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
     except OSError:
+        pass
+
+
+def _load_qimei_file() -> dict:
+    try:
+        data = json.loads(_QIMEI_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_persisted_qimei(group: Optional[str]) -> Optional[str]:
+    value = str(_load_qimei_file().get(group or "") or "").strip()
+    return value or None
+
+
+def _kick_off_qimei_detection(group: Optional[str]) -> None:
+    """后台线程里跑一次 SDK 现算（每个站点每进程只尝试一次）。"""
+    with _QIMEI_LOCK:
+        if group in _QIMEI_PENDING:
+            return
+        _QIMEI_PENDING.add(group)
+
+    def worker() -> None:
+        value = None
+        try:
+            value = detect_qimei_via_sdk(group)
+        finally:
+            with _QIMEI_LOCK:
+                _QIMEI_PENDING.discard(group)
+            if value:
+                _QIMEI_RUNTIME[group] = value
+                _persist_qimei(group, value)
+
+    threading.Thread(target=worker, name=f"qimei-{group}", daemon=True).start()
+
+
+def detect_qimei_via_sdk(group: Optional[str] = None) -> Optional[str]:
+    """按站点找客户端自带的 SDK 现算 qimei36（本机没装客户端时返回 None）。
+
+    先试本站点那款客户端，它的 product.json 没有 appKey（国际版）再试另一款 ——
+    qimei36 是设备级 id，用哪个 appKey 算出来都是同一台机器的那一个。
+    """
+    order = [group] + [other for other in _MAC_APP_BUNDLES if other != group]
+    for site_group in order:
+        if not site_group:
+            continue
+        app_dir = _MAC_APP_BUNDLES.get(site_group)
+        if not app_dir:
+            continue
+        try:
+            stamp = os.stat(app_dir).st_mtime
+        except OSError:
+            continue
+        value = _qimei_from_helper(app_dir, stamp)
+        if value:
+            return value
+    return None
+
+
+def _product_qimei_app_key(app_dir: str) -> Optional[str]:
+    """从客户端 product.json 读 qimei SDK 的 appKey（国际版没有，由调用方回退）。"""
+    path = os.path.join(
+        app_dir, "Contents", "Resources", "app.asar.unpacked", "cli", "product.json"
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
         return None
-    return _qimei_from_file(path, stamp)
+    keys = (data.get("config") or {}).get("qimei36AppKey") or {}
+    platform_key = {"Darwin": "darwin", "Windows": "win32"}.get(platform.system())
+    if not platform_key:
+        return None
+    value = str(keys.get(platform_key) or "").strip()
+    return value or None
+
+
+def _bundled_node() -> Optional[str]:
+    """找官方客户端自带的 node 运行时（官方 helper 就是用它跑的）。"""
+    candidates = [
+        "~/.workbuddy-ai/binaries/node/current/bin/node",
+        "~/.workbuddy/binaries/node/current/bin/node",
+        "~/.workbuddy-ai/binaries/node/versions/22.22.2-6/bin/node",
+        "~/.workbuddy/binaries/node/versions/22.22.2-3/bin/node",
+    ]
+    for candidate in candidates:
+        path = os.path.expanduser(candidate)
+        if os.path.exists(path):
+            return path
+    # 没有打包运行时就用系统 node（版本差异不影响 SDK 行为）
+    return shutil.which("node")
 
 
 def _json_compact(payload: dict) -> str:

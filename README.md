@@ -197,7 +197,7 @@ CB_GATEWAY_ADMIN_TOKEN=cb-admin-请换成足够长的随机值 python -m buddy2a
 2. **必须带 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`**。删掉任意一个、哪怕别的头全在，都会变成 `msg: request illegal`。
 3. **User-Agent 决定落到哪条后端流水线**：`WorkBuddy/<版本> …` 走桌面端会话流水线，`CLI/<版本> CodeBuddy/<版本>` 走 CLI 流水线。
 
-判定之外还有一层「像不像官方客户端」的形态约束，网关按官方安装包里的真实实现逐项对齐（`app.asar` 的 `cli/dist/codebuddy-headless.js` + `main/*.js`，详见 `docs/design/fingerprint.md`）：头名**全小写**、不带 `Accept-Encoding`/`Origin`/`Referer`，`x-no-*` 取值是 `true`；三个会话 id 都是 **uuid v7**，`X-Request-ID` 与 `X-Conversation-Message-ID` 同值、`X-Conversation-Request-ID` 一轮 prompt 一个；企业账号带 `X-Userinfo`（base64 JSON），有本机 qimei 的站点带 `X-Device-Id-List`。TLS 层也一并对齐：cipher 串与官方 Node 运行时（OpenSSL 3.5.5）一致、握手包不带 ALPN，JA3 与官方客户端完全相同；出站客户端共享 keep-alive 连接（相当于官方客户端的 `https.Agent({keepAlive:true})`）。默认身份是**桌面端 WorkBuddy**：UA 自称 `WorkBuddy/<桌面端版本> … CLI/<内置 CLI 版本>`，版本号从本机安装的客户端读取（国际版 `WorkBuddy AI.app`、国内版 `WorkBuddy.app`，两个站点各读各的），读不到才用内置回退值。`CB_GATEWAY_CHANNEL=cli` 可切回「命令行 CodeBuddy」身份。
+判定之外还有一层「像不像官方客户端」的形态约束，网关按官方安装包里的真实实现逐项对齐（`app.asar` 的 `cli/dist/codebuddy-headless.js` + `main/*.js`，详见 `docs/design/fingerprint.md`）：头名**全小写**、不带 `Accept-Encoding`/`Origin`/`Referer`，`x-no-*` 取值是 `true`；三个会话 id 都是 **uuid v7**，`X-Request-ID` 与 `X-Conversation-Message-ID` 同值、`X-Conversation-Request-ID` 一轮 prompt 一个；企业账号带 `X-Userinfo`（base64 JSON），两个站点都带 `X-Device-Id-List`（qimei36 是设备级 id：国内版读客户端缓存，国际版客户端自己没配 appKey，网关用官方自带的 qimei SDK 现算，值与本机国内版缓存一致）。TLS 层也一并对齐：cipher 串与官方 Node 运行时（OpenSSL 3.5.5）一致、握手包不带 ALPN，JA3 与官方客户端完全相同；出站客户端共享 keep-alive 连接（相当于官方客户端的 `https.Agent({keepAlive:true})`）。默认身份是**桌面端 WorkBuddy**：UA 自称 `WorkBuddy/<桌面端版本> … CLI/<内置 CLI 版本>`，版本号从本机安装的客户端读取（国际版 `WorkBuddy AI.app`、国内版 `WorkBuddy.app`，两个站点各读各的），读不到才用内置回退值。`CB_GATEWAY_CHANNEL=cli` 可切回「命令行 CodeBuddy」身份。
 
 会话 id 按「这段对话」派生（首条 system + 第一条 user 的哈希 → 稳定映射到同一个 uuid v7），多轮续聊稳定不变——官方客户端就是一个会话一个 id，每次请求都换新会话是它不会出现的形态；每条消息的 `X-Conversation-Message-ID` / `X-Request-ID` 仍逐次新生成。`CB_GATEWAY_CONVERSATION_ID=random` 可退回每次随机。
 
@@ -366,7 +366,7 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_GATEWAY_CLI_VERSION` | 冒充的内置 CLI 版本，默认从客户端里读取（旧名 `CB_GATEWAY_IDE_VERSION` 仍认） |
 | `CB_GATEWAY_CONVERSATION_ID` | 设为 `random` 则每次请求随机 `X-Conversation-ID`；默认按会话稳定派生 |
 | `CB_GATEWAY_USER_AGENT` | 整体覆盖 WorkBuddy 出站 User-Agent，默认按当前身份自拼 |
-| `CB_GATEWAY_QIMEI36` | 覆盖出站 `X-Device-Id-List` 里的 qimei36；默认按站点读官方客户端缓存文件，`off` 可摘掉这个头 |
+| `CB_GATEWAY_QIMEI36` | 覆盖出站 `X-Device-Id-List` 里的 qimei36；默认读客户端缓存文件，读不到就用官方自带的 qimei SDK 现算并落盘到 `.debug/qimei36.json`，`off` 可摘掉这个头 |
 
 ## 数据和安全
 
