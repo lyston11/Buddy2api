@@ -300,15 +300,61 @@ def workbuddy_reasoning_effort(control: ReasoningControl) -> Optional[str]:
         return None
     if control.mode == "enabled":
         return "high"
-    return {
-        "minimal": "low",
-        "low": "low",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
-        "ultra": "max",
-    }.get(control.effort, control.effort)
+    return WORKBUDDY_EFFORT_DIALECT.get(control.effort, control.effort)
+
+
+# WorkBuddy 后端的思考档位方言由上游逐模型声明（catalog 的 supportedEfforts）。
+# 实测它并不是统一的 low/high/max ：deepseek-v4.1-flash 是 [low, high, max]，
+# glm-5.2 是 [high, xhigh]，gpt-5.6-sol 是 [low, medium, high, xhigh, max]。
+# 所以不能写死一张表 —— 目录没声明时才用这张兼容表（与历史行为一致）。
+WORKBUDDY_EFFORT_DIALECT = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+    "ultra": "max",
+}
+
+# 档位强弱顺序，用于「该模型不支持这个值」时向邻近档位吸附。
+WORKBUDDY_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+
+
+def snap_workbuddy_effort(control: ReasoningControl, supported) -> Optional[str]:
+    """把标准档位投到**该模型实际声明支持的**那一档。
+
+    为什么必须有它：实测（2026-10-30）deepseek-v4.1-flash 的目录档位是
+    `[low, high, max]`，而网关以前只对两个写死的模型 ID（deepseek-v4-pro /
+    deepseek-v4-flash）做方言投影，其余模型的标准档位是**原样透传**的 ——
+    `xhigh`、`medium`、`minimal` 就这样发给了上游。上游不会因此报错，但实测
+    `xhigh` 与 `low` 的思考 token 数无法区分（21-27 vs 21-34）：无论它是忽略
+    未知值还是等价处理，结果都是「已经调到最高，实际并没有变强」。
+
+    吸附方向：先用兼容表投影，若不在 supported 里就**向上**找最近的受支持档位，
+    都没比它高才向下 —— 用户要求更强时不要悄悄降级。
+    没有 supported 信息时退回兼容表（旧行为）。
+    """
+    if control.mode in {"default", "disabled"}:
+        return None
+    preferred = (
+        "high" if control.mode == "enabled"
+        else WORKBUDDY_EFFORT_DIALECT.get(control.effort, control.effort)
+    )
+    options = [
+        str(item).strip().lower()
+        for item in (supported or ())
+        if isinstance(item, str) and str(item).strip()
+    ]
+    if not options or preferred in options:
+        return preferred
+    rank = {value: index for index, value in enumerate(WORKBUDDY_EFFORT_ORDER)}
+    wanted = rank.get(preferred, len(WORKBUDDY_EFFORT_ORDER))
+    ordered = sorted(options, key=lambda value: rank.get(value, len(WORKBUDDY_EFFORT_ORDER)))
+    for value in ordered:
+        if rank.get(value, -1) >= wanted:
+            return value
+    return ordered[-1]
 
 
 def normalize_chat_reasoning(payload: dict, *, prefer_nested: bool = False) -> dict:

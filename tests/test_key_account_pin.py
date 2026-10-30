@@ -312,3 +312,191 @@ def test_admin_update_key_validates_against_effective_channel(clean_routing, mon
     with pytest.raises(HTTPException) as error:
         asyncio.run(server.admin_update_key(key_id, FakeRequest({"default_account": wb}), "Bearer admin"))
     assert error.value.status_code == 400
+
+
+# ============================================================
+# API Key 站点限定（api_keys.default_site）
+# ============================================================
+
+def test_add_api_key_defaults_to_any_site():
+    db.add_api_key("sk-cb-site-default", "any")
+    assert db.get_api_key_by_key("sk-cb-site-default")["default_site"] == ""
+
+
+def test_site_pin_restricts_candidates_without_disabling_them(clean_routing):
+    """限定站点是硬过滤：只剩该站点的账号，另一边完全不参与。"""
+    intl = _add_account("intl", "u-intl", domain="www.workbuddy.ai", priority=0)
+    _add_account("cn", "u-cn", domain="www.workbuddy.cn", priority=10)
+
+    auth_manager.set_pinned_site("international")
+    assert auth_manager.pinned_site() == "international"
+    assert auth_manager.pick_account()["id"] == intl
+
+    # 国内站优先级别更高，但限定国际站时不能被它抢走
+    auth_manager.set_pinned_site("domestic")
+    picked = auth_manager.pick_account()
+    assert picked["id"] != intl
+    assert picked["domain"] == "www.workbuddy.cn"
+
+
+def test_site_pin_fails_instead_of_crossing_sites(clean_routing):
+    """该站点没有可用账号时报无可用账号，绝不静默跨站点。"""
+    _add_account("intl", "u-intl", domain="www.workbuddy.ai")
+
+    auth_manager.set_pinned_site("domestic")
+    assert auth_manager.pick_account() is None
+
+
+def test_site_pin_overrides_site_preference(clean_routing):
+    """站点偏好只说「优先哪边」，Key 限定说的是「只用哪边」，后者赢。"""
+    intl = _add_account("intl", "u-intl", domain="www.workbuddy.ai")
+    cn = _add_account("cn", "u-cn", domain="www.workbuddy.cn")
+    db.set_setting("model_site_preference", '{"default": "international", "models": {}}')
+
+    auth_manager.set_pinned_site("domestic")
+    assert auth_manager.pick_account(model="glm-5.3")["id"] == cn
+
+    auth_manager.set_pinned_site("")
+    assert auth_manager.pick_account(model="glm-5.3")["id"] == intl
+
+
+def test_site_pin_applies_to_pinned_account(clean_routing):
+    """绑定账号与站点限定冲突时返回 None（配置矛盾不能靠静默跨站解决）。"""
+    cn = _add_account("cn", "u-cn", domain="www.workbuddy.cn")
+    auth_manager.set_pinned_account(cn)
+
+    auth_manager.set_pinned_site("international")
+    assert auth_manager.pick_account() is None
+
+    auth_manager.set_pinned_site("domestic")
+    assert auth_manager.pick_account()["id"] == cn
+
+
+def test_site_pin_filters_fallback_refresh(clean_routing, monkeypatch):
+    """过期账号刷新回退也必须遵守站点限定，否则刷新值会绕过候选过滤。"""
+    intl = _add_account("intl", "u-intl", domain="www.workbuddy.ai", status="expired")
+    cn = _add_account("cn", "u-cn", domain="www.workbuddy.cn", status="expired")
+
+    refreshed: list[int] = []
+
+    async def fake_refresh(account):
+        refreshed.append(account["id"])
+        db.update_account(account["id"], {"status": "active"})
+        return True
+
+    monkeypatch.setattr(auth_manager, "refresh_token", fake_refresh)
+
+    async def run():
+        auth_manager.set_pinned_site("domestic")
+        return await auth_manager.pick_account_with_fallback()
+
+    account = asyncio.run(run())
+
+    assert refreshed == [cn]
+    assert account["id"] == cn
+    assert intl not in refreshed
+
+
+def test_apply_key_account_pin_sets_site_contextvar(clean_routing):
+    import buddy2api.server as server
+
+    server._apply_key_account_pin({"default_site": "domestic"})
+    assert auth_manager.pinned_site() == "domestic"
+
+    server._apply_key_account_pin({"default_site": "garbage"})
+    assert auth_manager.pinned_site() == ""
+
+    server._apply_key_account_pin(None)
+    assert auth_manager.pinned_site() == ""
+
+
+def test_validate_key_site_rejects_unknown_values():
+    import buddy2api.server as server
+    from fastapi import HTTPException
+
+    assert server._validate_key_site(None) == ""
+    assert server._validate_key_site("") == ""
+    assert server._validate_key_site("international") == "international"
+    assert server._validate_key_site("Domestic") == "domestic"
+
+    with pytest.raises(HTTPException) as error:
+        server._validate_key_site("cn")
+    assert error.value.status_code == 400
+
+
+def test_admin_create_key_stores_default_site(clean_routing, monkeypatch):
+    import asyncio
+
+    import buddy2api.server as server
+
+    monkeypatch.setattr(server, "_check_admin", lambda *_a, **_k: None)
+
+    class FakeRequest:
+        def __init__(self, payload):
+            self._payload = payload
+
+        async def stream(self):
+            yield json.dumps(self._payload).encode("utf-8")
+
+    result = asyncio.run(
+        server.admin_create_key(
+            FakeRequest({"name": "cn-only", "default_channel": "workbuddy",
+                         "default_site": "domestic"}),
+            "Bearer admin",
+        )
+    )
+    assert result["default_site"] == "domestic"
+    assert db.get_api_key_by_key(result["key"])["default_site"] == "domestic"
+
+
+def test_admin_rejects_site_and_account_mismatch(clean_routing, monkeypatch):
+    """站点限定与账号绑定必须自洽，否则请求永远选不到号。"""
+    import asyncio
+
+    import buddy2api.server as server
+    from fastapi import HTTPException
+
+    intl = _add_account("intl", "u-intl", domain="www.workbuddy.ai")
+    cn = _add_account("cn", "u-cn", domain="www.workbuddy.cn")
+    monkeypatch.setattr(server, "_check_admin", lambda *_a, **_k: None)
+
+    class FakeRequest:
+        def __init__(self, payload):
+            self._payload = payload
+
+        async def stream(self):
+            yield json.dumps(self._payload).encode("utf-8")
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            server.admin_create_key(
+                FakeRequest({"name": "bad", "default_channel": "workbuddy",
+                             "default_site": "domestic", "default_account": intl}),
+                "Bearer admin",
+            )
+        )
+    assert error.value.status_code == 400
+
+    kid = db.add_api_key("sk-cb-mix", "mix", default_account=cn, default_site="domestic")
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            server.admin_update_key(kid, FakeRequest({"default_site": "international"}), "Bearer admin")
+        )
+    assert error.value.status_code == 400
+
+    # 解除绑定后可以自由改站点
+    asyncio.run(
+        server.admin_update_key(
+            kid, FakeRequest({"default_account": 0, "default_site": "international"}), "Bearer admin",
+        )
+    )
+    assert db.get_api_key_by_key("sk-cb-mix")["default_site"] == "international"
+
+
+def test_database_normalizes_unknown_default_site(clean_routing):
+    """写入侧兜底：任何调用方都写不进未知站点值。"""
+    kid = db.add_api_key("sk-cb-bogus", "bogus", default_site="cn")
+    assert db.get_api_key_by_key("sk-cb-bogus")["default_site"] == ""
+
+    db.update_api_key(kid, {"default_site": "moon"})
+    assert db.get_api_key_by_key("sk-cb-bogus")["default_site"] == ""

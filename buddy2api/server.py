@@ -41,6 +41,7 @@ import buddy2api.providers as providers
 import buddy2api.router as router
 import buddy2api.control_plane as control_plane
 import buddy2api.seamless_login as seamless_login
+import buddy2api.sites as sites
 from buddy2api.paths import PROJECT_ROOT
 from buddy2api.providers.protocol import KNOWN_CHANNEL_SET
 from buddy2api.providers.qclaw.store import default_guid, upsert_account as upsert_qclaw_account
@@ -265,14 +266,27 @@ def _validate_key_account(value, channel: str) -> int:
     return account_id
 
 
+def _validate_key_site(value) -> str:
+    """校验并归一化 API Key 的站点限定。'' = 不限，其余必须是 sites.SITE_GROUPS。"""
+    text = str(value or "").strip().lower()
+    if text in ("", *sites.SITE_GROUPS):
+        return text
+    raise HTTPException(
+        status_code=400,
+        detail=f"default_site must be one of: '', {', '.join(sites.SITE_GROUPS)}",
+    )
+
+
 def _apply_key_account_pin(api_key_info: dict | None) -> None:
-    """按 API Key 的 default_account 把本次请求绑到固定账号。
+    """按 API Key 的 default_account / default_site 限定本次请求的账号池。
 
     只在请求入口调用一次：写入 contextvars 后，本次请求的异步生成器与
     run_in_threadpool 都会继承它，所以流式响应里选号也生效。
     刻意不在 finally 里复位 —— 端点返回后流式消费才真正开始，提前复位会丢失绑定。
     """
-    auth_manager.set_pinned_account((api_key_info or {}).get("default_account"))
+    info = api_key_info or {}
+    auth_manager.set_pinned_account(info.get("default_account"))
+    auth_manager.set_pinned_site(info.get("default_site"))
 
 
 def _reserve_client_quota(key_info: dict | None):
@@ -1113,11 +1127,20 @@ async def admin_create_key(
         raise HTTPException(status_code=400, detail="default_channel is required")
     default_channel = _validate_key_channel(data.get("default_channel"))
     default_account = _validate_key_account(data.get("default_account"), default_channel)
+    default_site = _validate_key_site(data.get("default_site"))
+    if default_site and default_account:
+        account = db.get_account(default_account)
+        if account and sites.site_group(account.get("domain")) != default_site:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Account {default_account} does not belong to site '{default_site}'",
+            )
     # 生成 sk- 前缀的 key
     key = f"sk-cb-{secrets.token_urlsafe(32)}"
     kid = db.add_api_key(
         key, name, allowed, daily_limit, client_type,
         default_channel=default_channel, default_account=default_account,
+        default_site=default_site,
     )
     return {
         "id": kid,
@@ -1125,6 +1148,7 @@ async def admin_create_key(
         "status": "ok",
         "default_channel": default_channel,
         "default_account": default_account,
+        "default_site": default_site,
     }
 
 
@@ -1154,6 +1178,23 @@ async def admin_update_key(
             existing = next((k for k in db.list_api_keys() if int(k["id"]) == kid), None)
             channel = str((existing or {}).get("default_channel") or "workbuddy")
         data["default_account"] = _validate_key_account(data.get("default_account"), channel)
+    if "default_site" in data:
+        data["default_site"] = _validate_key_site(data.get("default_site"))
+    if "default_account" in data or "default_site" in data:
+        # 站点限定与账号绑定冲突（绑了国际版账号却限定国内版）只会让请求永远无可用
+        # 账号，所以在写入时就报 400，而不是留到调用时才 503。两个字段都可能只改
+        # 其中一个，所以要用「生效后」的组合判定。
+        existing = next((k for k in db.list_api_keys() if int(k["id"]) == kid), None) or {}
+        site = str(data.get("default_site", existing.get("default_site") or "") or "")
+        pinned = int(data.get("default_account", existing.get("default_account") or 0) or 0)
+        if site and pinned:
+            account = db.get_account(pinned)
+            if account and sites.site_group(account.get("domain")) != site:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Account {pinned} does not belong to site '{site}'; "
+                           f"clear the account binding first",
+                )
     if "allowed_models" in data and (
         data["allowed_models"] is not None
         and (not isinstance(data["allowed_models"], list) or not all(isinstance(model, str) for model in data["allowed_models"]))

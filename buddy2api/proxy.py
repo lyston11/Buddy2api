@@ -13,6 +13,7 @@ proxy.py — 请求代理转发
 import asyncio
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -28,6 +29,7 @@ from buddy2api.upstream_transport import client_scope
 from buddy2api.reasoning_controls import (
     chat_reasoning_effort,
     resolve_reasoning_control,
+    snap_workbuddy_effort,
     workbuddy_reasoning_effort,
 )
 
@@ -454,6 +456,61 @@ def _configured_reasoning_default(model: str) -> str | None:
     return value if value in _VALID_REASONING_DEFAULTS else None
 
 
+# 模型 → 上游声明的思考档位。缓存在这里而不是每次遍历目录：建请求体是每个请求的
+# 热路径（`catalog.current_models` 要读 settings、合并手动项、过一遍墓碑过滤），
+# 而档位表几乎不变。TTL 取与站点计费画像相同的 60s，刷新目录后 1 分钟内自然生效。
+_EFFORT_DIALECT_TTL = 60.0
+_effort_dialect_lock = threading.Lock()
+_effort_dialect_cache: tuple[float, dict[str, list[str]]] = (0.0, {})
+
+
+def _workbuddy_effort_dialect() -> dict[str, list[str]]:
+    """目录里每个模型声明的 supportedEfforts（小写化）；带 60s 缓存。"""
+    global _effort_dialect_cache
+    now = time.time()
+    with _effort_dialect_lock:
+        stamp, cached = _effort_dialect_cache
+        if now - stamp < _EFFORT_DIALECT_TTL:
+            return cached
+    mapping: dict[str, list[str]] = {}
+    try:
+        import buddy2api.catalog as catalog
+
+        for item in catalog.current_models("workbuddy"):
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("id") or "").strip()
+            reasoning = item.get("reasoning")
+            efforts = reasoning.get("supportedEfforts") if isinstance(reasoning, dict) else None
+            if not mid or not isinstance(efforts, list):
+                continue
+            clean = [
+                str(value).strip().lower()
+                for value in efforts
+                if isinstance(value, str) and value.strip()
+            ]
+            if clean:
+                mapping[mid] = clean
+    except Exception:
+        mapping = {}
+    with _effort_dialect_lock:
+        _effort_dialect_cache = (now, mapping)
+    return mapping
+
+
+def _workbuddy_supported_efforts(model: str) -> list[str] | None:
+    """目录里该模型声明的思考档位；未声明时返回 None（不猜测、不改方言）。
+
+    只读本地目录、不打上游：目录由「一键读取供应模型」写入，转发热路径不能为此发
+    网络请求。目录缺失或该模型没有 supportedEfforts 时返回 None，调用方回退到
+    固定方言表（与旧行为一致）。
+    """
+    mid = str(model or "").strip()
+    if not mid:
+        return None
+    return _workbuddy_effort_dialect().get(mid)
+
+
 # 上游要求第一条消息必须是 system prompt，否则返回
 # {"code":11128,"msg":"first message is not system prompt"}。
 # 客户端（如 pi 的标题生成请求）不一定带 system，缺失时这里补一条。
@@ -651,7 +708,20 @@ def build_backend_body(payload: dict) -> dict:
         if default_reasoning:
             body["reasoning_effort"] = default_reasoning
     else:
-        if body["model"] in _REASONING_DEFAULT_MODEL_IDS:
+        # WorkBuddy 每个模型的思考档位方言由上游自己声明（目录里的 supportedEfforts）：
+        # deepseek-v4.1-flash 是 [low, high, max]、glm-5.2 是 [high, xhigh]、
+        # gpt-5.6-sol 是 [low, medium, high, xhigh, max] —— 并不统一。
+        # 以前只对两个写死的模型 ID 做方言投影，其余模型把标准档位（xhigh / medium /
+        # minimal）**原样透传**给上游。上游不会因此报错，但实测 deepseek-v4.1-flash
+        # 的 `xhigh` 与 `low` 思考 token 数无法区分（21-27 vs 21-34）——无论上游是
+        # 忽略未知值还是等价处理，结果都是「已经调到最高，实际并没有变强」。
+        # 所以只能按上游自己声明的档位表发值。
+        # 只在目录**确实声明**了 supportedEfforts 时才吸附；没声明就维持旧的透传语义，
+        # 不凭猜测改别人的方言。
+        supported = _workbuddy_supported_efforts(body["model"])
+        if supported is not None:
+            reasoning_effort = snap_workbuddy_effort(reasoning_control, supported)
+        elif body["model"] in _REASONING_DEFAULT_MODEL_IDS:
             reasoning_effort = workbuddy_reasoning_effort(reasoning_control)
         else:
             reasoning_effort = chat_reasoning_effort(reasoning_control)

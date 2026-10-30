@@ -14,6 +14,7 @@ import buddy2api.database as db
 import buddy2api.proxy as proxy
 from conftest import patch_upstream_client
 import buddy2api.reasoning_controls as reasoning_controls
+from buddy2api.reasoning_controls import resolve_reasoning_control, snap_workbuddy_effort
 import buddy2api.responses as responses
 import buddy2api.server as server
 import buddy2api.auth_manager as auth_manager
@@ -4126,3 +4127,109 @@ def test_blank_reasoning_counts_as_missing(monkeypatch):
     })
 
     assert body["messages"][-3]["reasoning"] == " "
+
+
+# ============================================================
+# 思考档位方言吸附（目录 supportedEfforts）
+# ============================================================
+
+@pytest.fixture()
+def dialect_catalog(monkeypatch):
+    """把目录里的档位表钉死，避免测试依赖真实 DB 的目录内容。"""
+    table = {
+        "deepseek-v4.1-flash": ["low", "high", "max"],
+        "glm-5.2": ["high", "xhigh"],
+        "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
+    }
+    monkeypatch.setattr(proxy, "_workbuddy_effort_dialect", lambda: dict(table))
+    monkeypatch.setattr(
+        proxy, "_workbuddy_supported_efforts", lambda model: table.get(str(model or "").strip())
+    )
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
+    return table
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        # 目录只声明 [low, high, max]：xhigh 必须落到 max，否则上游静默按默认档跑
+        # （实测 xhigh 与 low 的思考 token 数没有区别）。
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("xhigh", "max"),
+        ("max", "max"),
+        ("ultra", "max"),
+    ],
+)
+def test_effort_snaps_to_declared_dialect(dialect_catalog, requested, expected):
+    body = proxy.build_backend_body({
+        "model": "deepseek-v4.1-flash",
+        "messages": [],
+        "reasoning_effort": requested,
+    })
+
+    assert body["reasoning_effort"] == expected
+
+
+def test_effort_snaps_upward_when_declared_dialect_is_narrower(dialect_catalog):
+    """目录只有 [high, xhigh] 时，minimal 不能原样透传（上游不认识），要向上升。"""
+    body = proxy.build_backend_body({
+        "model": "glm-5.2", "messages": [], "reasoning_effort": "minimal",
+    })
+    assert body["reasoning_effort"] == "high"
+
+    body = proxy.build_backend_body({
+        "model": "glm-5.2", "messages": [], "reasoning_effort": "max",
+    })
+    # 比 xhigh 更高的档位不存在，向下取最接近（而不是原样发 max 被上游忽略）
+    assert body["reasoning_effort"] == "xhigh"
+
+
+def test_effort_keeps_passthrough_when_catalog_declares_nothing(dialect_catalog):
+    """目录没声明 supportedEfforts 的模型维持旧语义：标准档位原样透传。"""
+    body = proxy.build_backend_body({
+        "model": "kimi-k3", "messages": [], "reasoning_effort": "xhigh",
+    })
+
+    assert body["reasoning_effort"] == "xhigh"
+
+
+def test_effort_falls_back_to_dialect_for_legacy_deepseek_ids(dialect_catalog):
+    """deepseek-v4-pro / -v4-flash 没有 supportedEfforts，继续走固定方言表。"""
+    for model in ("deepseek-v4-pro", "deepseek-v4-flash"):
+        body = proxy.build_backend_body({
+            "model": model, "messages": [], "reasoning_effort": "xhigh",
+        })
+        assert body["reasoning_effort"] == "max"
+
+
+def test_snap_workbuddy_effort_handles_empty_and_unknown_inputs():
+    control = resolve_reasoning_control({"reasoning_effort": "xhigh"})
+
+    assert snap_workbuddy_effort(control, []) == "max"        # 无声明 → 方言表
+    assert snap_workbuddy_effort(control, None) == "max"
+    assert snap_workbuddy_effort(control, ["weird"]) == "weird"  # 只剩未知值时原样用
+
+
+def test_effort_dialect_is_cached(monkeypatch):
+    """建请求体是热路径：目录只能被读一次（60s TTL），不能每请求都遍历。"""
+    calls = []
+
+    import buddy2api.catalog as catalog
+
+    def fake_current_models(channel):
+        calls.append(channel)
+        return [{"id": "m1", "reasoning": {"supportedEfforts": ["low", "high"]}}]
+
+    monkeypatch.setattr(catalog, "current_models", fake_current_models)
+    monkeypatch.setattr(proxy, "_effort_dialect_cache", (0.0, {}))
+
+    proxy._workbuddy_effort_dialect()
+    proxy._workbuddy_effort_dialect()
+    proxy._workbuddy_effort_dialect()
+
+    assert len(calls) == 1
+    assert proxy._workbuddy_supported_efforts("m1") == ["low", "high"]
+    assert proxy._workbuddy_supported_efforts("missing") is None

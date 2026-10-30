@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import buddy2api.credential_crypto as credential_crypto
+import buddy2api.sites as sites
 from buddy2api.paths import PROJECT_ROOT
 
 DB_PATH = Path(os.environ.get("CB_GATEWAY_DB_PATH", PROJECT_ROOT / "codebuddy_gateway.db"))
@@ -352,6 +353,17 @@ def _migrate_api_keys(conn: sqlite3.Connection):
     conn.execute(
         "UPDATE api_keys SET default_account=0 "
         "WHERE default_account IS NULL OR default_account < 0"
+    )
+    # API Key 级站点限定：'' = 不限（走站点偏好调度），'domestic'/'international' = 只
+    # 用该站点的账号。口径与 sites.site_group 一致（见 auth_manager.set_pinned_site）。
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+    if "default_site" not in cols:
+        conn.execute(
+            "ALTER TABLE api_keys ADD COLUMN default_site TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        "UPDATE api_keys SET default_site='' "
+        "WHERE default_site IS NULL OR default_site NOT IN ('domestic','international')"
     )
 
 
@@ -719,19 +731,24 @@ def get_account_checkin_cache(account_id: int, today_only: bool = True) -> Optio
 def add_api_key(key: str, name: str, allowed_models: Optional[list] = None,
                 daily_limit: Optional[int] = None, client_type: str = "custom",
                 default_channel: str = "workbuddy",
-                default_account: Optional[int] = None) -> int:
+                default_account: Optional[int] = None,
+                default_site: Optional[str] = None) -> int:
     now = int(time.time())
     models_json = json.dumps(allowed_models) if allowed_models else None
     limit = int(daily_limit or 0)
     channel = str(default_channel or "workbuddy").strip() or "workbuddy"
     account_id = max(0, int(default_account or 0))
+    site = str(default_site or "").strip().lower()
+    if site not in sites.SITE_GROUPS:
+        site = ""
     with _lock:
         conn = get_conn()
         cur = conn.execute("""
             INSERT INTO api_keys
                 (key_prefix, key_hash, key_secret, name, status, allowed_models,
-                 daily_limit, client_type, default_channel, default_account, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 daily_limit, client_type, default_channel, default_account,
+                 default_site, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             _key_prefix(key),
             _hash_api_key(key),
@@ -743,6 +760,7 @@ def add_api_key(key: str, name: str, allowed_models: Optional[list] = None,
             client_type,
             channel,
             account_id,
+            site,
             now,
         ))
         kid = cur.lastrowid
@@ -755,7 +773,7 @@ def update_api_key(kid: int, data: dict):
     fields = []
     values = []
     for k in ["name", "status", "allowed_models", "daily_limit", "client_type",
-              "default_channel", "default_account"]:
+              "default_channel", "default_account", "default_site"]:
         if k in data:
             val = data[k]
             if k == "allowed_models" and isinstance(val, list):
@@ -764,6 +782,12 @@ def update_api_key(kid: int, data: dict):
                 # 写入侧已由 server._validate_key_account 严格校验；这里只做兜底归一，
                 # 保证任何调用方都写不进负数。
                 val = max(0, int(val or 0))
+            if k == "default_site":
+                # 写入侧已由 server._validate_key_site 严格校验；这里只归一，
+                # 保证任何调用方都写不进未知站点值。
+                val = str(val or "").strip().lower()
+                if val not in (sites.SITE_DOMESTIC, sites.SITE_INTERNATIONAL):
+                    val = ""
             fields.append(f"{k}=?")
             values.append(val)
     if not fields:

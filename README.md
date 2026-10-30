@@ -286,7 +286,10 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 **要固定用某个账号**：在「模型配置 → 模型别名」注册一个别名（如 `deepseek-v4.1-flash@acc-a` → `deepseek-v4.1-flash`），再建一把 `default_account` 指向该账号的 Key，然后在 DSH 里给这个别名单独配一个 provider、用那把 Key。
-⚠️ **别名本身不绑定账号**——用通用 Key 调 `@别名` 仍会走负载均衡。真正决定账号的是 **Key 的 `default_account`**。
+⚠️ **别名本身不绑定账号** —— 用通用 Key 调 `@别名` 仍会走负载均衡。真正决定账号的是 **Key 的 `default_account`**。
+
+**要按国内版/国际版分流**：API Keys 列表里每把 Key 多一列「站点」，可选 `不限` / `只走国际版` / `只走国内版`（对应 `default_site` = `''` / `international` / `domestic`）。限定后这把 Key 的候选账号只剩该站点（国内 `*.cn`、国际 `*.workbuddy.ai`），该站点没有可用账号时直接返回无可用账号，**不会静默跨站点**——这正是「按 Key 分开消耗两边额度」需要的语义。不限定（默认）时行为不变，仍按模型的站点偏好自动挑免费/便宜的一边。
+绑定账号与站点限定冲突（绑了国际版账号却限定国内版）会在写入时返回 400，不会留到调用时才失败。
 
 ### 模型容量与自动发现
 
@@ -295,6 +298,10 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 各通道缺失的容量字段分别默认显示 262,144 上下文 / 32,768 输出，`capacity_source` 标记每个字段来自 `catalog` 还是 `fallback`。默认值是配置兜底，不是上游保证；同名模型在不同通道的限制也可能不同。仅当目录中有已知输出限制时，网关会把显式的 `max_tokens` / `max_completion_tokens` 裁剪到该限制（Responses 的 `max_output_tokens` 经转换后同样适用）。未指定输出预算的请求不注入预算，未知容量不用于强制裁剪。达到输出上限仍可能以 `length` 结束，容量发现不能保证长任务永不截断。
 
 目录里带思考档位的通道（目前只有 WorkBuddy）会把上游的 `supportsReasoning`、`reasoning.supportedEfforts`、默认档和 `canDisableThinking` 一并写进 `/v1/models`，裸 id 与 `workbuddy/` 前缀都带。上游没给档位列表就不编——QClaw、QwenWork、TraeWork 只按各自协议处理思考，不在模型列表里发明档位。部署后需要再点一次 WorkBuddy 的「一键读取供应模型」，旧目录里没有这些字段。
+
+**思考档位不是统一的**：上游每个模型自己声明 `supportedEfforts`，实测并不一致——`deepseek-v4.1-flash` 是 `[low, high, max]`、`glm-5.2` 是 `[high, xhigh]`、`gpt-5.6-sol` 是 `[low, medium, high, xhigh, max]`。网关以前只对两个写死的模型 ID（`deepseek-v4-pro` / `-v4-flash`）做方言投影，其余模型的标准档位（`xhigh` / `medium` / `minimal`）是**原样透传**的；上游对不认识的值不报错，而是静默按默认档跑（实测 `deepseek-v4.1-flash` 的 `xhigh` 与 `low` 思考 token 数无法区分，21-27 vs 21-34），表现就是「调到最高但没变化」。现在建请求体时按目录里该模型的 `supportedEfforts` 吸附档位（向上取最近受支持档位，不悄悄降级），目录没声明时保持旧的透传语义；档位表带 60s 缓存，不在热路径上反复读目录。
+
+客户端（pi / DSH 等）那一侧也要注意：pi 的 `/thinking` 只列出模型自己支持的档位，而 **`xhigh` 与 `max` 必须显式写在 `thinkingLevelMap` 里**（其余档位默认可用到 `high`，`xhigh`/`max` 未映射即视为不支持）。所以自定义 provider 里给推理模型补一行 `thinkingLevelMap`（如 `{"off": null, "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}`），否则菜单最高只到 `high`——这并不是网关截断，而是客户端根本没把这两档发出来。
 
 ### 失败分类
 

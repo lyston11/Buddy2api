@@ -108,6 +108,13 @@ _pinned_account_id: contextvars.ContextVar[int] = contextvars.ContextVar(
     "cb_pinned_account_id", default=0
 )
 
+# API Key 级站点限定：'' = 不限（按站点偏好调度），'domestic'/'international' = 只用
+# 该站点的账号。与 default_account 的差别：绑定账号是「只用一个号」，站点限定是
+# 「只用一个站的号」，后者仍然在站点内正常调度。取值与 sites.site_group 同一口径。
+_pinned_site: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cb_pinned_site", default=""
+)
+
 # 连续鉴权失败计数（401/403 或刷新被拒）。只有达到阈值才会触发复核/失效，
 # 避免一次瞬时 401 就把账号永久停用。
 _auth_failure_lock = threading.Lock()
@@ -1947,6 +1954,21 @@ def pinned_account_id() -> int:
         return 0
 
 
+def set_pinned_site(site) -> None:
+    """把当前请求限定到某个站点分组。空值/未知值 = 不限定。"""
+    text = str(site or "").strip().lower()
+    _pinned_site.set(text if text in sites.SITE_GROUPS else "")
+
+
+def pinned_site() -> str:
+    """当前请求限定的站点分组，空串表示不限定。"""
+    try:
+        text = str(_pinned_site.get() or "")
+    except (TypeError, ValueError):
+        return ""
+    return text if text in sites.SITE_GROUPS else ""
+
+
 def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str, model: Optional[str] = None) -> Optional[dict]:
     """绑定账号时的选择逻辑：只认这一个账号，不可用就返回 None。
 
@@ -1957,8 +1979,13 @@ def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str, model: 
         return None
     if account_unavailable_reason(aid):
         return None
+    site = pinned_site()
     target = db.get_account(aid)
     if not target:
+        return None
+    if site and sites.site_group(target.get("domain")) != site:
+        # 站点限定优先于账号绑定：两处配置冲突（绑了国际版账号却把 Key 限定到国内版）
+        # 时宁可报无可用账号，也不静默跨站点调用。
         return None
     if str(target.get("provider") or "workbuddy") != provider:
         return None
@@ -2001,19 +2028,25 @@ def pick_account(
     漏报常态，见 `_account_models` 上方注释）。
 
     最后：API Key 若绑定了账号（default_account>0），只返回那个账号。绑定优先于所有
-    调度规则 —— 它存在的意义就是让调用方指定用哪个账号。
+    调度规则 —— 它存在的意义就是让调用方指定用哪个账号。API Key 若限定了站点
+    （default_site），则候选池在第一步就被硬过滤成该站点的账号（见 `pinned_site`）：
+    这是显式要求「只用国内/国际号」，不是优先级，所以宁可报无可用账号也不跨站调用。
     """
     exclude_ids = exclude_ids or set()
     pinned = pinned_account_id()
     if pinned:
         return _pick_pinned_account(pinned, exclude_ids, provider, model)
     accounts = db.get_active_accounts(provider)
+    site_pin = pinned_site()
     candidates = [
         a for a in accounts
         if a["id"] not in exclude_ids
         and not account_is_cooling_down(a["id"])
         and not account_unavailable_reason(a["id"])
         and not is_route_excluded(a)
+        # Key 限定站点时硬过滤：这是显式要求「只用国内/国际账号」，
+        # 若像站点偏好那样只是软优先级，跨站点调用就违背了配置本身。
+        and (not site_pin or sites.site_group(a.get("domain")) == site_pin)
     ]
     if not candidates:
         return None
@@ -2112,12 +2145,17 @@ async def pick_account_with_fallback(
         ),
         key=_route_sort_key,
     )
+    site_pin = pinned_site()
     for a in expired_accounts:
         if a["id"] in (exclude_ids or set()):
             continue
         # 被隔离的账号同样不参与「过期账号刷新」这条回退路径：否则它会先被刷新、
         # 再以 active 身份回到候选池，隔离就形同虚设。
         if is_route_excluded(a):
+            continue
+        # 站点限定同样要在这条回退路径生效：否则刷新一个跨站点的过期账号，
+        # 返回值会绕过 pick_account 的候选过滤。
+        if site_pin and sites.site_group(a.get("domain")) != site_pin:
             continue
         if model and account_model_rate_limited(a["id"], model):
             continue
