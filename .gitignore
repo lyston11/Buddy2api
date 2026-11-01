@@ -92,3 +92,6 @@ ant-code-uploads/
 # 本地诊断产物（上游 4xx 请求快照）与 pytest 临时目录
 debug_rejects/
 .pytest_tmp/
+
+# 本地未提交改动快照（.unipi 工具生成）
+.unipi/

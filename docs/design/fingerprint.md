@@ -21,6 +21,11 @@
 | `x-device-id-list` | 不发 | 两个站点都发（见下节） | `{"qimei36":…}` |
 | 连接 | 每个请求新建客户端（新 TCP+TLS） | 共享 keep-alive 客户端 | `https.Agent({keepAlive:true})` |
 | Cookie | httpx 自带 jar | 空 jar（永不发 Cookie） | 无 jar |
+| `Accept-Encoding` | 不发 | `gzip, compress, deflate` | 同左（axios `httpAdapter` 每次自己补） |
+| `x-private-data` | `true`（写死） | `false`（= 厂商默认） | `enableModelOptimization ? "false" : "true"` |
+| `acp-connection-id` / `x-codebuddy-request` / `x-agent-purpose` | 塞进 chat | 不发 | 只出现在本地 ACP 通道 |
+| `x-custom-channel-id` / `x-device-id-list` | 塞进 chat | 不发 | 只在 `/auth/state`（`AuthStateHeaderProvider`） |
+| `x-no-*` / `x-domain` | 塞进 chat | 不发 | `x-no-*` 只在 `/auth/state` 首调；`x-domain` 只在 iOA 环境 |
 
 ## 证据从哪来
 
@@ -125,3 +130,57 @@ python/httpx/axios 自报 UA 这些项钉死；`tests/test_fingerprint_headers.p
 - 国内站（`www.workbuddy.cn`，带本机 qimei 的 `x-device-id-list`）：`200`。
 
 `400 code 11128` 在这三次里都没有出现。
+
+## 2026-11-01：按两个发行版的可执行代码逐个字段复核
+
+前面几轮的依据是 `app.asar` 里的 `main/*`，但**真正发 `/v2/chat/completions` 的是内置
+CLI**（`cli/dist/codebuddy-headless.js` 的 `axiosToFetchAdapter`）。这一轮把两份发行版
+（国内 `WorkBuddy.app` 5.5.6 / CLI 2.137.1；国际 `WorkBuddy AI.app` 5.7.6 / CLI 2.156.1）
+都拆开，只统计**该函数体内**写进 chat 请求的头，得到确切的集合：
+
+```
+accept / content-type / accept-encoding / x-requested-with
+x-conversation-id / x-conversation-request-id / x-conversation-message-id / x-request-id
+x-agent-intent / x-agent-type
+x-ide-type / x-ide-name / x-ide-version / x-private-data / x-product
+authorization / user-agent
+traceparent / b3 / x-b3-traceid / x-b3-parentspanid / x-b3-spanid / x-b3-sampled / x-trace-id
+x-user-id（+ 企业账号的 x-enterprise-id / x-tenant-id / x-userinfo）
+```
+
+两个发行版在这上面完全一致。在此之前网关多发了 7 个头、少发 1 个、写错 1 个值：
+
+- **多发**：`acp-connection-id`（本地 ACP 通道的 id）、`x-codebuddy-request`（服务端标记）、
+  `x-agent-purpose`、`x-custom-channel-id` 与 `x-device-id-list`（`/auth/state` 一侧的
+  `AuthStateHeaderProvider`）、`x-no-user-id` / `x-no-enterprise-id`（`/auth/state` 首调的
+  「这几个字段为空」标记）、`x-domain`（iOA 环境才由 `applyIOADefaultHeaders` 补）。
+  一个真实客户端不会在 chat 上发其中任何一个。
+- **少发**：`accept-encoding: gzip, compress, deflate` —— chat 走 axios，它的 `httpAdapter`
+  在每次请求上都会自己 `set("Accept-Encoding", ...)`。之前为了模仿 Node 裸 http 模块
+  「什么都不发」，反而是缺了个真实客户端必带的头。
+- **写错**：`x-private-data`。官方 `getCustomHeaders()` 的取值是
+  `enableModelOptimization ? "false" : "true"`，该设置未配置时默认为 enabled，所以真实
+  客户端发 `false`；网关此前写死 `true`，与厂商默认值正相反。可用
+  `CB_GATEWAY_PRIVATE_DATA=true` 覆盖（对应「在客户端里关掉模型优化」的状态）。
+
+### TLS 指纹依赖解释器，必须自检
+
+JA3 的 cipher 列表由 `NODE_DEFAULT_CIPHERS` 决定，但 **`ec_point_formats` 由 OpenSSL
+版本决定**：3.5.5 → `[3,0,1,2]`（与官方 Node v22.22.2 一致），3.6.2 → `[1,0]`
+（md5 变成 `14cb250fd211…`）。官方客户端自带 Node 运行时是 OpenSSL 3.5.5，项目 `.venv`
+也是 3.5.5，所以只有用 `.venv/bin/python` 启动才能对上；用系统 Python（3.6.2）启动会
+静默换一枚指纹。为此：
+
+- `upstream_transport.tls_fingerprint_md5()` 用 `ssl.MemoryBIO` 在内存里逼出 ClientHello
+  现算 JA3（不联网），`fingerprint_warning()` 给出人话告警；
+- `server.main()` 启动横幅里打印「出站指纹: 与官方客户端一致」，不一致时打整段警告；
+- `tests/test_fingerprint_wire.py::test_tls_fingerprint_self_check_matches_reference`
+  把这条钉进 CI（在错的解释器下会红，这正是想要的信号）。
+
+### 线上复核（2026-11-01）
+
+对 6 个真实账号（国内 3 + 国际 3）用新头集合各发 2 条 `deepseek-v4.1-flash` 流式请求：
+全部 `200`，首行仍是 `: heartbeat`（桌面流水线）。同时做了对照组：整组删除上述任一头、
+或只保留真实客户端的头集合，**上游都回 200** —— 说明这些差异目前不是硬性拦截条件，
+但它们正是「账号级风控」（11140/11141/11142）会据以判定的信号，所以按真实客户端的
+实际形态收敛，而不是等被拦了再改。

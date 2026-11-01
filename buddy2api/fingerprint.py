@@ -127,6 +127,16 @@ _DEFAULT_CHANNEL = CHANNEL_APP
 
 _DISABLED_VALUES = {"off", "none", "false", "0", ""}
 
+# 官方内置 CLI 的 axios 在每次请求上都会自己补这个头（axios 1.16.1 的
+# `httpAdapter`：`headers.set("Accept-Encoding", "gzip, compress, deflate")`）。
+# 网关此前完全不发（为了模仿 Node 的裸 http 模块），但 chat 请求走的是 axios，
+# 缺这个头本身就是可识别的差异。
+ACCEPT_ENCODING = "gzip, compress, deflate"
+
+# 官方 `getCustomHeaders()`：`x-private-data = enableModelOptimization ? "false" : "true"`。
+# 该设置未配置时默认 enabled，所以真实客户端发的是 "false"。可用环境变量钉住。
+_PRIVATE_DATA_DEFAULT = "false"
+
 # qimei36 现算：进程内缓存 + 落盘缓存（`.debug/qimei36.json`）+ 一次性后台探测。
 _QIMEI_RUNTIME: dict[str, str] = {}
 _QIMEI_PENDING: set[str] = set()
@@ -517,6 +527,17 @@ def _json_compact(payload: dict) -> str:
 # 请求上下文（渠道 / 会话 id / 本轮 request id）
 # ============================================================
 
+def private_data_value() -> str:
+    """`x-private-data` 的取值：厂商默认 "false"，可用 CB_GATEWAY_PRIVATE_DATA 覆盖。
+
+    只有把客户端设置里的「模型优化」显式关掉，真实客户端才发 "true"。
+    """
+    override = (os.environ.get("CB_GATEWAY_PRIVATE_DATA") or "").strip().lower()
+    if override in {"true", "false"}:
+        return override
+    return _PRIVATE_DATA_DEFAULT
+
+
 def channel_name() -> str:
     """当前生效的身份：app（桌面端）或 cli（命令行）。"""
     override = _channel_override.get()
@@ -658,6 +679,32 @@ def _identity_headers(account: dict) -> dict:
     return headers
 
 
+def _chat_identity_headers(account: dict) -> dict:
+    """chat 请求的身份头：只有真正存在的字段，**不发** `x-no-*` 兜底标记。
+
+    官方内置 CLI 在 chat 路径上用 `runIdentityHeaders()`（5.7.6）或
+    `getCustomHeaders()` + `applyIOADefaultHeaders()`（5.5.6），两者都只在字段存在时
+    才写头：`x-user-id` / `x-enterprise-id` / `x-tenant-id` / `x-userinfo`。
+    `x-no-user-id` 之类是 `/auth/state` 首次拉取时用的「我先声明这些字段为空」标记，
+    `x-domain` 只在 iOA 环境才由 `applyIOADefaultHeaders` 补 —— 个人号真实请求里
+    一个都没有。网关此前把它们一起塞进 chat，等于每个请求都自报「我不是官方客户端」。
+    """
+    headers: dict = {}
+    uid = str(account.get("uid") or "").strip()
+    enterprise_id = str(account.get("enterprise_id") or "").strip()
+    if uid:
+        headers["x-user-id"] = uid
+    if enterprise_id:
+        headers["x-enterprise-id"] = enterprise_id
+        headers["x-tenant-id"] = enterprise_id
+    if uid and enterprise_id:
+        # 与 runIdentityHeaders() 的 x-userinfo 同形（仅有 uid 但无企业/来源时官方不发）
+        headers["x-userinfo"] = base64.b64encode(
+            _json_compact({"uin": uid, "owner_uin": enterprise_id}).encode("utf-8")
+        ).decode("ascii")
+    return headers
+
+
 def _device_headers(account: dict) -> dict:
     """设备标识头（`AuthStateHeaderProvider` 的产物）。"""
     headers: dict = {"x-custom-channel-id": "unknown"}
@@ -731,12 +778,14 @@ def chat_headers(account: dict, channel: Optional[str] = None) -> dict:
     message_id = uuid7_hex()
 
     if current == CHANNEL_CLI:
+        # 这套就是内置 CLI 的真实形态（chat 本来就由它发），头集合与下面的 app
+        # profile 一致：不带 acp-connection-id / x-device-id-list / x-no-* / x-domain。
         headers: dict = {
             # axios 的默认 accept（桌面端那条 fetch 路径只写 application/json）
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
+            "accept-encoding": ACCEPT_ENCODING,
         }
-        headers.update(_identity_headers(account))
         headers.update(
             {
                 "x-conversation-id": current_conversation_id(),
@@ -748,38 +797,42 @@ def chat_headers(account: dict, channel: Optional[str] = None) -> dict:
                 "x-ide-type": "CLI",
                 "x-ide-name": "CLI",
                 "x-ide-version": cli_version(domain),
-                "x-private-data": "true",
+                "x-private-data": private_data_value(),
                 "x-product": "SaaS",
             }
         )
-        headers.update(_device_headers(account))
+        headers.update(_chat_identity_headers(account))
         headers.update(_authorization(account))
         headers["user-agent"] = user_agent(domain, current)
         return headers
 
+    # 头集合以官方内置 CLI 的 chat 路径为准（app.asar 里
+    # cli/dist/codebuddy-headless.js 的 `axiosToFetchAdapter`）：
+    # 它只把下面这批写进 chat 请求，**不发** acp-connection-id / x-custom-channel-id /
+    # x-device-id-list / x-agent-purpose / x-codebuddy-request / x-no-* / x-domain ——
+    # 那些分别属于本地 ACP 通道、/auth/state 首调、以及「该字段缺席」的语义标记。
+    # 以前网关把它们一起塞进 chat，等于每个请求都自报「我不是官方客户端」。
     headers = {
         "accept": "application/json",
         "content-type": "application/json",
+        "accept-encoding": ACCEPT_ENCODING,
         "x-requested-with": "XMLHttpRequest",
         "x-conversation-id": current_conversation_id(),
         "x-conversation-request-id": current_conversation_request_id(),
-        # 本地 ACP 连接 id（桌面端每个会话一个），客户端随机生成
-        "acp-connection-id": str(uuid.uuid4()),
         "x-conversation-message-id": message_id,
         "x-request-id": message_id,
         "x-agent-intent": "craft",
         "x-agent-type": "main",
-        # 桌面端会话固定标成 conversation 用途
-        "x-agent-purpose": "conversation",
-        "x-codebuddy-request": "1",
         "x-ide-type": "WorkBuddy",
         "x-ide-name": "WorkBuddy",
         "x-ide-version": app_version(domain),
-        "x-private-data": "true",
+        # 官方 `getCustomHeaders()` 的取值是 `enableModelOptimization ? "false" : "true"`，
+        # 该设置未配置时默认 enabled → 真实客户端发的是 **"false"**。网关此前写死 "true"，
+        # 与厂商默认值相反，是个一眼可查的偏差。
+        "x-private-data": private_data_value(),
         "x-product": "SaaS",
     }
-    headers.update(_identity_headers(account))
-    headers.update(_device_headers(account))
+    headers.update(_chat_identity_headers(account))
     headers.update(_authorization(account))
     headers["user-agent"] = user_agent(domain, current)
     headers.update(_trace_headers())

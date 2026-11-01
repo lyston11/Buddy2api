@@ -226,6 +226,51 @@ def direct_transport() -> httpx.AsyncHTTPTransport:
     return httpx.AsyncHTTPTransport(verify=ssl_context())
 
 
+def tls_fingerprint_md5() -> str:
+    """现算当前解释器/OpenSSL 组合下 ClientHello 的 JA3（纯内存，不联网）。
+
+    用 MemoryBIO 逼出握手包，再用 wire_probe 的解析器算 JA3。用途是启动自检：
+    JA3 取决于 **Python 链接的 OpenSSL 版本**（cipher 列表一致、但 ec_point_formats
+    随 OpenSSL 版本变化 —— 实测 3.5.5 → `[3,0,1,2]`，3.6.2 → `[1,0]`），
+    换个解释器启动就会静默变成另一枚指纹。
+    """
+    import buddy2api.wire_probe as wire_probe
+
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    context = ssl_context()
+    obj = context.wrap_bio(incoming, outgoing, server_side=False)
+    try:
+        obj.do_handshake()
+    except ssl.SSLWantReadError:
+        pass
+    hello = outgoing.read()
+    return wire_probe.ja3(hello)["ja3_md5"]
+
+
+def tls_fingerprint_ok() -> bool:
+    """JA3 是否与官方客户端运行时一致。"""
+    try:
+        return tls_fingerprint_md5() == NODE_JA3_MD5
+    except Exception:  # pragma: no cover - 自检不能拖垮启动
+        return False
+
+
+def fingerprint_warning() -> Optional[str]:
+    """启动时该打的指纹告警（一致就返回 None）。"""
+    try:
+        actual = tls_fingerprint_md5()
+    except Exception as exc:  # pragma: no cover
+        return f"TLS 指纹自检失败：{exc}"
+    if actual == NODE_JA3_MD5:
+        return None
+    return (
+        f"TLS 指纹与官方客户端不一致：当前 {actual}，应为 {NODE_JA3_MD5}。\n"
+        f"      原因是当前解释器的 OpenSSL 版本不是 3.5.5（实际 {ssl.OPENSSL_VERSION}）。\n"
+        f"      ClientHello 的 ec_point_formats 随 OpenSSL 版本变化，换版本就换指纹。\n"
+        f"      用项目自带的 .venv/bin/python 启动即可（它链接 OpenSSL 3.5.5）。"
+    )
+
+
 def fallback_transport() -> Optional[FallbackTransport]:
     """有代理候选时返回兜底传输层；没有候选返回 None（调用方保持原样直连）。"""
     proxy = proxy_for_retry()

@@ -7,7 +7,7 @@
    的基准值比 —— 只配 `upstream_transport.ssl_context()` 就能做到完全一致，
    见 `NODE_JA3_MD5`；
 2. **打印原始请求行 + 头**，用来核对头名大小写、头集合与插入顺序（官方客户端是
-   axios/fetch，头名全小写、没有 `accept-encoding`）。
+   axios/fetch，头名全小写、`accept-encoding` 恒为 `gzip, compress, deflate`）。
 
 自签证书直接用 `cryptography` 现场生成，不需要联网、不碰真上游。
 
@@ -262,9 +262,18 @@ def compare(baseline_ja3_md5: str, captured: dict) -> list[str]:
         )
     if captured["ja3"]["alpn"]:
         problems.append(f"握手包里带了 ALPN 扩展: {captured['ja3']['alpn']!r}（Node 不发）")
-    names = [name for name, _ in captured["request_head"]["headers"]]
-    if any(name.lower() == "accept-encoding" for name in names):
-        problems.append("请求头里带了 accept-encoding（官方客户端不发）")
+    values = {name.lower(): value for name, value in captured["request_head"]["headers"]}
+    # chat 走的是 axios：它的 httpAdapter 每次都会把 Accept-Encoding 设成
+    # "gzip, compress, deflate"（Node 的裸 http 模块才不发）。有偏差的是 httpx 默认值，
+    # 所以这里比对的是取值而不是有无。
+    if "accept-encoding" in values:
+        import buddy2api.fingerprint as fingerprint
+
+        if values["accept-encoding"] != fingerprint.ACCEPT_ENCODING:
+            problems.append(
+                f"accept-encoding 取值不对: {values['accept-encoding']!r}"
+                f"（官方客户端是 {fingerprint.ACCEPT_ENCODING!r}）"
+            )
     return problems
 
 

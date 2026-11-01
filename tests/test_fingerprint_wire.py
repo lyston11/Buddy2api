@@ -45,8 +45,11 @@ def test_wire_headers_look_like_the_real_client():
     names = [name for name, _ in captured["request_head"]["headers"]]
     lowered = [name.lower() for name in names]
 
-    # 官方客户端不发 accept-encoding（Python 的 httpx 默认会带）
-    assert "accept-encoding" not in lowered
+    # 官方 chat 走 axios，它的 httpAdapter 每次都会补这一个值
+    # （`headers.set("Accept-Encoding", "gzip, compress, deflate")`）；
+    # 要的是与 httpx 默认的 "gzip, deflate, br, zstd" 不同，而不是干脆不发。
+    values = {name.lower(): value for name, value in captured["request_head"]["headers"]}
+    assert values["accept-encoding"] == "gzip, compress, deflate"
     # 我们显式给的头一律小写，只有 Node 自己补的三个自动头是首字母大写
     auto_headers = {
         name for name in names if name in {"Host", "Connection", "Content-Length"}
@@ -83,3 +86,10 @@ def test_wire_headers_have_no_python_or_sdk_artifacts():
     assert "axios" not in user_agent.lower()
     assert "node-fetch" not in user_agent.lower()
     assert not any(name.startswith("x-stainless") for name in lowered)
+
+
+def test_tls_fingerprint_self_check_matches_reference():
+    """启动自检用同一个 JA3 基准（纯内存，连不上真上游也能跑）。"""
+    assert upstream_transport.tls_fingerprint_md5() == upstream_transport.NODE_JA3_MD5
+    assert upstream_transport.tls_fingerprint_ok() is True
+    assert upstream_transport.fingerprint_warning() is None

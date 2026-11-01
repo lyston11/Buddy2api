@@ -9,8 +9,8 @@
 
   1. TLS ClientHello 的 JA3 是否与官方客户端运行时（内置 CLI 的 Node v22 /
      OpenSSL 3.5.5）一致，握手包里是否混进了 ALPN 扩展；
-  2. 请求头是不是官方客户端那种形态：头名全小写、没有 `accept-encoding`、
-     没有 python/httpx/axios 自报的 UA、三个会话头齐全。
+  2. 请求头是不是官方客户端那种形态：头名全小写、`accept-encoding` 是 axios 的
+     `gzip, compress, deflate`、没有 python/httpx/axios 自报的 UA、三个会话头齐全。
 
 基准值来自 2026-10-27 的实测，写在 `buddy2api/upstream_transport.py`
 （`NODE_DEFAULT_CIPHERS` / `NODE_JA3_MD5`），推导与残留差异见

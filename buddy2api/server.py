@@ -42,6 +42,7 @@ import buddy2api.router as router
 import buddy2api.control_plane as control_plane
 import buddy2api.seamless_login as seamless_login
 import buddy2api.sites as sites
+import buddy2api.upstream_transport as upstream_transport
 from buddy2api.paths import PROJECT_ROOT
 from buddy2api.providers.protocol import KNOWN_CHANNEL_SET
 from buddy2api.providers.qclaw.store import default_guid, upsert_account as upsert_qclaw_account
@@ -1719,6 +1720,13 @@ def main():
         f"  启动导入: {'on' if control_plane.auto_import_enabled() else 'off (CB_GATEWAY_AUTO_IMPORT=1 可打开)'}\n"
     )
     sys.stderr.write(f"  出站代理: {outbound_proxy}\n")
+    # 上游有渠道校验，TLS 指纹换一枚就等于自报「我不是官方客户端」。JA3 取决于
+    # Python 链接的 OpenSSL 版本，换个解释器启动就会静默变化，所以每次启动都自检。
+    warning = upstream_transport.fingerprint_warning()
+    if warning:
+        sys.stderr.write(f"  [警告] {warning}\n")
+    else:
+        sys.stderr.write("  出站指纹: 与官方客户端一致\n")
     sys.stderr.write(f"  Admin: {'local automatic access' if LOCAL_MODE else 'token required'}\n")
     if ADMIN_TOKEN:
         sys.stderr.write("  Admin Token: configured (hidden)\n")
