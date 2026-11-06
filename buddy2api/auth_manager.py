@@ -1283,6 +1283,65 @@ def _unwrap_response(data: object) -> tuple[bool, str, dict]:
 # ============================================================
 # 官方额度资源
 # ============================================================
+#
+# 「剩余多少积分」只有一个正确口径：官方桌面端自己怎么算。这边以前读的是
+# `POST /v2/billing/meter/get-user-resource` 的 `TotalDosage` + 自己按
+# `ExpiredTime/DeductionEndTime/CycleEndTime` 判过期，两处都和官方不一致：
+#
+# - `TotalDosage` 是服务端的**另一种**累加，连官方客户端都不用（它按分组拉明细
+#   自己求和）。实测 190****9272：TotalDosage=600，官方界面 100；
+#   19730034833：TotalDosage=2180，官方 2176.49（差 500 是体验版切片包）。
+# - 体验版（`CapacityType=4`）是**按月切片**的额度：真实可用量在
+#   `SlicePeriodUsageDetails[0].SlicePeriodCapacityRemainPrecise`，而
+#   `CycleCapacityRemainPrecise` 报的是整包上限 500 —— 按后者求和会凭空多出
+#   500 分，这正是「国内账号显示的积分比实际多」的直接原因。
+#
+# 现在的做法与官方客户端逐行对齐（app.asar 里 BackendProvider.getPersonalUsage）：
+#
+#   api1 `get-user-resource-summary`                  → 总余额（服务端已去重）
+#   api2 `get-user-resource-paid-packages`            → 付费包明细（续费信息）
+#   api3 `get-user-resource-free-packages`            → 免费/赠送包明细（含切片窗口）
+#
+# 请求体同样照抄官方：`Status: [0, 3]`（有效 + 已用完）、按 PackageCodes 分组、
+# 每页 200 条翻页、切片包带当天 `SlicePeriodStartTime/EndTime`。
+# 注意这三个接口的网关路由**不带** `/v2`（v2 路径会 404）。
+
+# 官方商品码（app.asar 的 COMMODITY_CODES）。分成付费包与免费包两路拉取，
+# 与官方 fetchUserResources 的 PAID_PACKAGE_CODES / FREE_PACKAGE_CODES 同源。
+_WB_PAID_PACKAGE_CODES = (
+    "TCACA_code_002_AkiJS3ZHF5",  # proMon
+    "TCACA_code_005_maRGyrHhw1",  # proMonPlus
+    "TCACA_code_003_FAnt7lcmRT",  # proYear
+    "TCACA_code_023_4xbGhMrE6q",  # youth
+    "TCACA_code_026_BaESVICNoi",  # advanced
+    "TCACA_code_027_0FCGVA6vSa",  # flagship
+    "TCACA_code_009_0XmEQc2xOf",  # extra
+    "TCACA_code_038_OhvqZtiPKr",  # extra38
+    "TCACA_code_036_lupO5WgNdG",  # extraIntl
+)
+_WB_FREE_PACKAGE_CODES = (
+    "TCACA_code_001_PqouKr6QWV",  # free（每日签到额度）
+    "TCACA_code_008_cfWoLwvjU4",  # freeMon（国内个人体验版，切片包）
+    "TCACA_code_035_ArVxJcGDsm",  # freeMonIntl
+    "TCACA_code_006_DbXS0lrypC",  # gift
+    "TCACA_code_039_KRcQj7wUat",  # proTrialMon
+    "TCACA_code_040_mi9rCYg46x",  # proTrialYear
+    "TCACA_code_007_nzdH5h4Nl0",  # activity（运营裂变/赠送包）
+    "TCACA_code_028_NtpWi0jzXs",  # bonus28
+    "TCACA_code_037_WxOD3MpI2o",  # bonusIntl
+    "TCACA_code_029_6wCGEWquYy",  # bonus29
+    "TCACA_code_030_BjSt89qTvr",  # bonus30
+)
+_WB_RESOURCE_PAGE_SIZE = 200
+_WB_RESOURCE_MAX_PAGES = 10
+# 官方 DAILY_CREDITS：这个包按天刷新，到期时间看 CycleEndTime 而不是 DeductionEndTime。
+_WB_DAILY_PACKAGE_CODE = "TCACA_code_001_PqouKr6QWV"
+# 切片包（按月分发额度）：真实余量在 SlicePeriodUsageDetails 里。
+_WB_SLICE_CAPACITY_TYPE = 4
+# 额度缓存的口径版本。旧缓存里的 total_dosage 是上游 TotalDosage（偏大），
+# available_total 也把体验版按整包上限累加过 —— 一律不能当新口径读。
+_WB_RESOURCE_SCHEMA = 2
+
 
 def _to_float(value, default: float = 0.0) -> float:
     try:
@@ -1325,6 +1384,32 @@ def _parse_resource_time(value) -> tuple[int | None, str]:
     return None, text
 
 
+def _package_capacity(item: dict) -> tuple[float, float]:
+    """一个资源包「本期总量 / 本期剩余」，返回 (total, left)。
+
+    官方 `resolveResourceCapacity` 的两个分支，照抄语义：
+
+    - 切片包（`CapacityType=4`，国内个人体验版）优先读当期切片明细；后端对国内
+      freeMon 可能只下发 `CycleCapacity*Precise` 而**不**下发
+      `SlicePeriodUsageDetails`，此时必须回落到周期额度，否则体验版整行变 0。
+    - 其余包读 `CycleCapacity*Precise`。
+
+    注意：`CapacityRemainPrecise`/`CapacityRemain` 是**整包**余量，官方界面从不读它；
+    以前用它做兜底，正是多算的来源。
+    """
+    if _to_int(item.get("CapacityType")) == _WB_SLICE_CAPACITY_TYPE:
+        slices = item.get("SlicePeriodUsageDetails")
+        if isinstance(slices, list) and slices and isinstance(slices[0], dict):
+            first = slices[0]
+            total = _to_float(first.get("SlicePeriodCapacitySizePrecise"))
+            left = _to_float(first.get("SlicePeriodCapacityRemainPrecise"))
+            return total, left
+    return (
+        _to_float(item.get("CycleCapacitySizePrecise"), _to_float(item.get("CycleCapacitySize"))),
+        _to_float(item.get("CycleCapacityRemainPrecise"), _to_float(item.get("CycleCapacityRemain"))),
+    )
+
+
 def _safe_resource_item(item: dict, now_ts: int) -> dict:
     cycle_end_ts, cycle_end = _parse_resource_time(item.get("CycleEndTime"))
     cycle_start_ts, cycle_start = _parse_resource_time(item.get("CycleStartTime"))
@@ -1332,15 +1417,20 @@ def _safe_resource_item(item: dict, now_ts: int) -> dict:
     deduction_start_ts, deduction_start = _parse_resource_time(item.get("DeductionStartTime"))
     expired_ts, expired_time = _parse_resource_time(item.get("ExpiredTime"))
 
-    remain = _to_float(item.get("CapacityRemainPrecise"), _to_float(item.get("CapacityRemain")))
-    used = _to_float(item.get("CapacityUsedPrecise"), _to_float(item.get("CapacityUsed")))
-    size = _to_float(item.get("CapacitySizePrecise"), _to_float(item.get("CapacitySize")))
-    cycle_remain = _to_float(item.get("CycleCapacityRemainPrecise"), _to_float(item.get("CycleCapacityRemain")))
-    cycle_used = _to_float(item.get("CycleCapacityUsedPrecise"), _to_float(item.get("CycleCapacityUsed")))
-    cycle_size = _to_float(item.get("CycleCapacitySizePrecise"), _to_float(item.get("CycleCapacitySize"), size))
-    effective_remain = cycle_remain if cycle_remain > 0 or cycle_used > 0 else remain
+    capacity_total, cycle_remain = _package_capacity(item)
+    cycle_size = capacity_total
+    remain = cycle_remain
+    used = max(0.0, capacity_total - cycle_remain) if capacity_total > 0 else 0.0
+    cycle_used = used
+    size = capacity_total
+    effective_remain = cycle_remain
 
-    expire_ts = expired_ts or deduction_end_ts or cycle_end_ts
+    # 到期时间按官方 planResources 的取法：每日签到包看 CycleEndTime，其余看
+    # DeductionEndTime；真被标记过期（ExpiredTime 已过）也照算。
+    package_code = str(item.get("PackageCode") or "")
+    is_daily = package_code == _WB_DAILY_PACKAGE_CODE
+    primary_end_ts = cycle_end_ts if is_daily else deduction_end_ts
+    expire_ts = expired_ts or primary_end_ts or cycle_end_ts or deduction_end_ts
     days_to_expire = None
     if expire_ts:
         days_to_expire = int((expire_ts - now_ts) / 86400)
@@ -1348,9 +1438,16 @@ def _safe_resource_item(item: dict, now_ts: int) -> dict:
     package_name = str(item.get("PackageName") or item.get("DealName") or item.get("ProductName") or "额度包")
     product_name = str(item.get("ProductName") or item.get("SubProductName") or "")
     status = _to_int(item.get("Status"))
-    is_expired = bool(expire_ts and expire_ts < now_ts)
+    # Status=3 是「已用完」，官方仍把它算进有效期内页签（余量为 0）。
+    # 真正过期只看 ExpiredTime，以及已用完且周期已结束的包。
+    is_expired = bool(expired_ts and expired_ts < now_ts)
+    if not is_expired and status == 3 and expire_ts and expire_ts <= now_ts:
+        is_expired = True
 
     return {
+        "package_code": package_code,
+        "capacity_type": _to_int(item.get("CapacityType")),
+        "slice_remaining": round(cycle_remain, 4) if _to_int(item.get("CapacityType")) == _WB_SLICE_CAPACITY_TYPE else None,
         "package_name": package_name,
         "product_name": product_name,
         "package_type": str(item.get("PackageType") or ""),
@@ -1384,6 +1481,84 @@ def _safe_resource_item(item: dict, now_ts: int) -> dict:
     }
 
 
+def _wb_slice_period_range(now_ts: int | None = None) -> dict:
+    """切片包的当日窗口（官方 `buildSlicePeriodRange`：本地时间 00:00:00 ~ 23:59:59）。"""
+    stamp = time.localtime(now_ts)
+    return {
+        "SlicePeriodStartTime": time.strftime("%Y-%m-%d 00:00:00", stamp),
+        "SlicePeriodEndTime": time.strftime("%Y-%m-%d 23:59:59", stamp),
+    }
+
+
+async def _fetch_wb_package_pages(client, base: str, headers: dict) -> tuple[list[dict], int]:
+    """拉全付费包 + 免费包明细（官方 api2 / api3），返回 (列表, 服务端报的 TotalCount)。
+
+    请求体与官方 `fetchResourcePackagesPage` 一致：按 PackageCodes 分组、
+    `Status: [0, 3]`（有效 + 已用完）、每页 200 条。注意路由**不带** `/v2`。
+    免费包额外带当天切片窗口，否则切片包拿不到 `SlicePeriodUsageDetails`。
+
+    翻页上限与官方同为 200 × 10：赠包会持续累积，截断时必须靠 TotalCount 让上层
+    看出“明细不全”，不能默默当全量。
+    """
+    slice_range = _wb_slice_period_range()
+    collected: list[dict] = []
+    reported_total = 0
+    for path, codes, extra in (
+        ("/billing/meter/get-user-resource-paid-packages", _WB_PAID_PACKAGE_CODES, {"NeedRenewInfo": True}),
+        ("/billing/meter/get-user-resource-free-packages", _WB_FREE_PACKAGE_CODES, slice_range),
+    ):
+        for page in range(1, _WB_RESOURCE_MAX_PAGES + 1):
+            body = {
+                "PageNumber": page,
+                "PageSize": _WB_RESOURCE_PAGE_SIZE,
+                "PackageCodes": list(codes),
+                "Status": [0, 3],
+                **extra,
+            }
+            resp = await client.post(f"{base}{path}", headers=headers, json=body)
+            if resp.status_code < 200 or resp.status_code >= 300:
+                raise ValueError(f"{path} -> HTTP {resp.status_code}")
+            payload = resp.json()
+            page_data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(page_data, dict):
+                raise ValueError(f"{path} returned no data")
+            rows = page_data.get("Accounts")
+            rows = rows if isinstance(rows, list) else []
+            collected.extend(r for r in rows if isinstance(r, dict))
+            reported_total = max(reported_total, _to_int(page_data.get("TotalCount")))
+            if len(rows) < _WB_RESOURCE_PAGE_SIZE or len(collected) >= reported_total:
+                break
+    # 同一 ResourceId 可能在两路重复下发，官方也是按 id 去重。
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for item in collected:
+        rid = str(item.get("ResourceId") or "")
+        if rid and rid in seen:
+            continue
+        if rid:
+            seen.add(rid)
+        deduped.append(item)
+    return deduped, reported_total
+
+
+def _wb_official_remaining(summary: dict, active_packages: list[dict]) -> float:
+    """官方口径的总剩余积分。
+
+    优先 api1 的 `Packages[].CycleRemainCapacity` 求和 —— 服务端已经做过订阅去重与
+    体验版切片处理，这也是官方 `sumSummaryCapacity` 的做法。api1 缺席（老账号/降级
+    上游没有这个接口）时回退到按官方 `resolveResourceCapacity` 算出来的有效包求和，
+    而不是回退到 `TotalDosage`。
+    """
+    rows = summary.get("Packages") if isinstance(summary, dict) else None
+    if isinstance(rows, list) and rows:
+        total = 0.0
+        for row in rows:
+            if isinstance(row, dict):
+                total += max(0.0, _to_float(row.get("CycleRemainCapacity")))
+        return round(total, 4)
+    return round(sum(float(p.get("remaining_precise") or 0) for p in active_packages), 4)
+
+
 def _resource_failure(
     account: dict,
     *,
@@ -1392,12 +1567,15 @@ def _resource_failure(
     allow_stale: bool = True,
 ) -> dict:
     cached = db.get_account_resource_cache(account.get("id")) if allow_stale and account.get("id") else None
-    if cached:
+    if cached and cached.get("schema") == _WB_RESOURCE_SCHEMA:
+        # 旧口径缓存不能当降级快照用：里面 total_dosage 是上游 TotalDosage（偏大），
+        # 展示出来等于把这次的偏差又带回来。宁可显示失败。
         cached["stale"] = True
         cached["message"] = message
         cached["status_code"] = status_code
         return cached
     return {
+        "schema": _WB_RESOURCE_SCHEMA,
         "ok": False,
         "status_code": status_code,
         "message": message,
@@ -1432,10 +1610,20 @@ async def fetch_account_resources(
     max_age_seconds: int = 60,
     allow_stale: bool = True,
 ) -> dict:
-    """查询官方额度资源，只返回安全摘要和额度包明细。"""
+    """查询官方额度，只返回安全摘要和额度包明细。
+
+    积分口径必须和官方桌面端一致：总余额取 api1（`get-user-resource-summary`）
+    服务端已经去重过的汇总，包明细取 api2/api3（付费/免费分开）。
+    ``get-user-resource`` 的 `TotalDosage` 不再参与计算 —— 它把切片包按整包上限
+    累加，实测会让国内账号凭空多出 500 分。
+    """
     if account.get("id") and not force:
         cached = db.get_account_resource_cache(account["id"])
-        if cached and int(cached.get("age_seconds") or 0) <= max_age_seconds:
+        if (
+            cached
+            and cached.get("schema") == _WB_RESOURCE_SCHEMA
+            and int(cached.get("age_seconds") or 0) <= max_age_seconds
+        ):
             cached["stale"] = False
             return cached
 
@@ -1447,10 +1635,14 @@ async def fetch_account_resources(
             allow_stale=allow_stale,
         )
 
+    base = backend_url_for(account)
     try:
         async with client_scope(account, request_timeout(25)) as c:
-            r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/get-user-resource", headers=headers, json={})
-            data = r.json()
+            summary_resp = await c.post(
+                f"{base}/billing/meter/get-user-resource-summary", headers=headers, json={}
+            )
+            summary_data = summary_resp.json()
+            raw_items, package_total = await _fetch_wb_package_pages(c, base, headers)
     except (httpx.HTTPError, ValueError) as e:
         return _resource_failure(
             account,
@@ -1458,15 +1650,13 @@ async def fetch_account_resources(
             allow_stale=allow_stale,
         )
 
-    ok, msg, payload = _unwrap_response(data)
-    if r.status_code < 200 or r.status_code >= 300:
+    ok, msg, summary = _unwrap_response(summary_data)
+    if summary_resp.status_code < 200 or summary_resp.status_code >= 300:
         ok = False
+        msg = msg or f"HTTP {summary_resp.status_code}"
 
-    response = payload.get("Response") if isinstance(payload.get("Response"), dict) else {}
-    raw_data = response.get("Data") if isinstance(response.get("Data"), dict) else {}
-    raw_items = raw_data.get("Accounts") if isinstance(raw_data.get("Accounts"), list) else []
     now_ts = int(time.time())
-    packages = [_safe_resource_item(x, now_ts) for x in raw_items if isinstance(x, dict)]
+    packages = [_safe_resource_item(x, now_ts) for x in raw_items]
     packages.sort(key=lambda x: (
         x.get("expired", False),
         x.get("expire_ts") or 9_999_999_999,
@@ -1492,20 +1682,26 @@ async def fetch_account_resources(
         None,
     )
     expired_packages = [p for p in packages if p.get("expired")]
+    available_total = _wb_official_remaining(summary, active_packages)
 
     result = {
+        "schema": _WB_RESOURCE_SCHEMA,
         "ok": ok,
-        "status_code": r.status_code,
+        "status_code": summary_resp.status_code,
         "message": msg,
         "account_id": account.get("id"),
         "account_name": account.get("nickname") or account.get("name") or str(account.get("id")),
-        "total_dosage": round(_to_float(raw_data.get("TotalDosage")), 4),
-        "resource_count": _to_int(raw_data.get("TotalCount"), len(packages)),
+        # 与官方界面一致：总余额就是 available_total；total_dosage 保留字段名只为
+        # 兼容旧前端/旧缓存，值不再是上游 TotalDosage。
+        "total_dosage": available_total,
+        "remaining": available_total,
+        "unit": "credit",
+        "resource_count": package_total or len(packages),
         "package_count": len(packages),
         "active_package_count": len(active_packages),
         "expired_package_count": len(expired_packages),
         "expiring_package_count": len(expiring_packages),
-        "available_total": round(sum(float(p.get("remaining_precise") or 0) for p in active_packages), 4),
+        "available_total": available_total,
         "expiring_7d_total": round(sum(float(p.get("remaining_precise") or 0) for p in expiring_packages), 4),
         "expiring_30d_total": round(sum(float(p.get("remaining_precise") or 0) for p in expiring_30d_packages), 4),
         "next_expire_time": next_expiring.get("expire_time") if next_expiring else "",
@@ -1527,7 +1723,7 @@ async def fetch_account_resources(
         return _resource_failure(
             account,
             message=msg,
-            status_code=r.status_code,
+            status_code=summary_resp.status_code,
             allow_stale=allow_stale,
         )
     return result

@@ -136,6 +136,25 @@ So the default site preference is **`auto`**: it reads the request log, measures
 
 To set it by hand, go to **Models → Site preference** and choose International / Domestic / Auto / No preference per model, or set a single default for models without their own entry.
 
+### How is the “official balance” number computed?
+
+The number matches **the official desktop client's own calculation**, it is not a second opinion of ours:
+
+| Purpose | Endpoint |
+| --- | --- |
+| Total balance | `POST /billing/meter/get-user-resource-summary` |
+| Paid package detail | `POST /billing/meter/get-user-resource-paid-packages` |
+| Free/bonus package detail | `POST /billing/meter/get-user-resource-free-packages` |
+
+All three routes are **without** `/v2` (with `/v2` they 404). The request bodies copy the official client too: `Status: [0, 3]` (valid + used up), grouped by commodity code, 200 items per page; the free-package call also carries today's `SlicePeriodStartTime` / `SlicePeriodEndTime`.
+
+Two things that are easy to get wrong — both were real bugs here:
+
+- **`TotalDosage` from `get-user-resource` is unusable.** It is a different server-side summation that the official client never reads. Measured on one domestic account: `TotalDosage=600` while the official UI showed `100`.
+- **The trial plan (`CapacityType=4`) is a sliced quota.** The real available amount lives in `SlicePeriodUsageDetails[0].SlicePeriodCapacityRemainPrecise`, while `CycleCapacityRemainPrecise` reports the full package cap of 500 — summing the latter inflates every domestic account by 500 credits. That was the direct cause of “the shown credits are higher than what I actually have”.
+
+So the “official balance” column is now exactly the number on the official page, and each package's “remaining” in the detail dialog is the current-period amount rather than the full package cap.
+
 ### How do expiring credits get used first?
 
 Account credits come in **time-limited packages** that are lost on expiry. So **on calls that really do consume credits**, the gateway prefers the account whose credits expire soonest — that is exactly what the “Expiring soon” column on the accounts page reports (the `30-day expiring` total plus the nearest expiry time).

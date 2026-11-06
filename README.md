@@ -170,6 +170,25 @@ CB_GATEWAY_ADMIN_TOKEN=cb-admin-请换成足够长的随机值 python -m buddy2a
 
 账号页每个账号名下方会标出它的站点（`国际版 · www.workbuddy.ai` / `国内版 · www.codebuddy.cn`），判定只看域名后缀。
 
+#### 「官方余额」这个数字是怎么算的
+
+口径与**官方桌面端自己**完全一致，不是我们另做一套：
+
+| 用途 | 接口 |
+| --- | --- |
+| 总余额 | `POST /billing/meter/get-user-resource-summary` |
+| 付费额度包明细 | `POST /billing/meter/get-user-resource-paid-packages` |
+| 免费/赠送额度包明细 | `POST /billing/meter/get-user-resource-free-packages` |
+
+三个路由都**不带** `/v2`（带 `/v2` 直接 404）。请求体照抄官方：`Status: [0, 3]`（有效 + 已用完）、按商品码分组、每页 200 条翻页；免费包那一路还要带当天 `SlicePeriodStartTime` / `SlicePeriodEndTime`。
+
+两个容易算错的地方，都是以前的实现踩过的坑：
+
+- **`get-user-resource` 的 `TotalDosage` 不能用。** 那是服务端另一种累加，官方客户端根本不用它。实测某国内账号 `TotalDosage=600`，官方界面 `100`。
+- **体验版（`CapacityType=4`）是切片额度。** 真实可用量在 `SlicePeriodUsageDetails[0].SlicePeriodCapacityRemainPrecise`，而 `CycleCapacityRemainPrecise` 报的是整包上限 500 —— 按后者累加会让每个国内账号凭空多出 500 分。这是「显示的积分比实际多」最直接的原因。
+
+所以「官方余额」列现在就是官方界面上的那个数，`明细` 里每个包的「剩余」也是当期余量而不是整包上限。
+
 ### 积分快过期了，怎么优先用掉？
 
 账号的积分是**限时包**，过期作废。所以**在真的会消耗积分的调用上**，网关会优先选积分最快到期的账号——账号页「即将到期」列就是这个依据（`30 天内到期` 的积分数 + 最近一次到期时间）。

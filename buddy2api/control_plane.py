@@ -309,7 +309,7 @@ async def _summarize_workbuddy_credit(provider, accounts: list[dict], force: boo
             limit=2,
         )
     ok = [row for row in resources if row.get("ok")]
-    remaining = round(sum(float(row.get("total_dosage") or row.get("available_total") or 0) for row in ok), 4)
+    remaining = round(sum(float(row.get("remaining") or row.get("available_total") or 0) for row in ok), 4)
     row = {
         "id": "workbuddy",
         "display_name": getattr(provider, "display_name", "workbuddy"),
@@ -419,7 +419,7 @@ async def credit_summary(force: bool = False) -> dict:
     low_accounts = []
     expiring_accounts = []
     for row in workbuddy_resources:
-        balance = float(row.get("total_dosage") or row.get("available_total") or 0)
+        balance = float(row.get("remaining") or row.get("available_total") or 0)
         item = {
             "account_id": row.get("account_id"),
             "account_name": row.get("account_name"),
