@@ -450,6 +450,7 @@ def account_unavailable_reason(aid: int) -> Optional[str]:
         code, reason, deadline = entry
         if deadline <= time.monotonic():
             _account_unavailable.pop(aid, None)
+            _persist_unavailable()
             return None
         return f"{reason}(code={code})"
 
@@ -458,12 +459,89 @@ def clear_all_account_unavailable() -> None:
     """清空全部长期不可用标记（测试与「全部恢复」排障用）。"""
     with _account_unavailable_lock:
         _account_unavailable.clear()
+    _persist_unavailable()
 
 
 def clear_account_unavailable(aid: int) -> None:
     """清掉长期不可用标记（刷新 token 成功、人工启用、探活恢复时调用）。"""
     with _account_unavailable_lock:
-        _account_unavailable.pop(aid, None)
+        removed = _account_unavailable.pop(aid, None) is not None
+    if removed:
+        _persist_unavailable()
+
+
+# ============================================================
+# 长期不可用的持久化
+# ============================================================
+#
+# 为什及必须落盘：这个状态以前只在进程内存里。重启一次（改代码、换配置、
+# 机器重开）就全丢了，于是**已被上游封掉的账号又会以「零负载」身份回到候选池
+# 最前面**，接着被派活、接着吃 11140 —— 2026-09-26 那批就是被反复重试了 925 次。
+# 封号本身是服务端行为，网关只能靠记住「已经问过」来避免自己去反复触发它。
+#
+# 存 settings 而不是加新表：数据量极小（账号数级别）、不需要查询，且已有
+# get_setting/set_setting 两个带锁的写入点。存的是**剩余秒数**而不是截止时间戳 ——
+# 进程重启不应该把冷却时长清零，也不应该因机器时间被调整而失真。
+_UNAVAILABLE_SETTING_KEY = "account_unavailable_cooldowns"
+_unavailable_loaded = False
+
+
+def _persist_unavailable() -> None:
+    """把当前冷却快照写入 settings（失败不影响主流程）。"""
+    now = time.monotonic()
+    with _account_unavailable_lock:
+        payload = {
+            str(aid): {
+                "code": int(code),
+                "reason": str(reason),
+                "seconds_left": max(0, int(deadline - now)),
+            }
+            for aid, (code, reason, deadline) in _account_unavailable.items()
+            if deadline > now
+        }
+    try:
+        db.set_setting(_UNAVAILABLE_SETTING_KEY, payload)
+    except Exception as exc:  # pragma: no cover - 持久化失败不能让请求链断了
+        print(f"[auth_manager] 长期不可用冷却落盘失败：{exc}", file=sys.stderr)
+
+
+def load_unavailable_state() -> int:
+    """启动时把落盘的长期不可用冷却读回来，返回恢复的条数。
+
+    只读一次（幂等）：重复调用直接返回 0，避免把同一条冷却反复叠上去。
+    """
+    global _unavailable_loaded
+    with _account_unavailable_lock:
+        if _unavailable_loaded:
+            return 0
+        _unavailable_loaded = True
+    try:
+        payload = db.get_setting(_UNAVAILABLE_SETTING_KEY, {}) or {}
+    except Exception:  # pragma: no cover
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    now = time.monotonic()
+    restored = 0
+    with _account_unavailable_lock:
+        for aid_text, entry in payload.items():
+            try:
+                aid = int(aid_text)
+                code = int(entry.get("code") or 0)
+                reason = str(entry.get("reason") or "")
+                seconds_left = int(entry.get("seconds_left") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if aid <= 0 or seconds_left <= 0:
+                continue
+            _account_unavailable[aid] = (code, reason, now + seconds_left)
+            restored += 1
+    if restored:
+        print(
+            f"[auth_manager] 恢复 {restored} 个账号的长期不可用冷却（重启不丢）",
+            file=sys.stderr,
+        )
+    return restored
 
 
 def account_unavailable_snapshot() -> dict[int, dict]:
@@ -504,6 +582,7 @@ def mark_account_unavailable(
             ACCOUNT_UNAVAILABLE_COOLDOWN_SECONDS * (2 ** hits),
         )
         _account_unavailable[aid] = (code, label, now + cooldown)
+    _persist_unavailable()
     print(
         f"[auth_manager] 账号 {aid} 上游标记为不可用（{label}，code={code}），"
         f"冷却 {int(cooldown // 60)} 分钟",

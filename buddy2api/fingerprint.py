@@ -754,7 +754,7 @@ def common_headers(account: dict, channel: Optional[str] = None) -> dict:
             "x-ide-version": (
                 app_version(domain) if current == CHANNEL_APP else cli_version(domain)
             ),
-            "x-private-data": "true",
+            "x-private-data": private_data_value(),
             "x-product": "SaaS",
         }
     )

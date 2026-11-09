@@ -1705,6 +1705,9 @@ def main():
         ap.error(str(exc))
 
     db.init_db()
+    # 长期不可用冷却落盘过：重启后必须先读回来，否则已被上游封掉的账号会以
+    # 「零负载」身份重新回到候选池最前面，接着被派活、接着吃 11140。
+    auth_manager.load_unavailable_state()
 
     startup = control_plane.startup_scan()
     sys.stderr.write(f"[startup] discover: {startup}\n")

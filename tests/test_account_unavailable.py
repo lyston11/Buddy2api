@@ -30,8 +30,12 @@ def isolated_db(tmp_path, monkeypatch):
     credential_crypto.reset_cache()
     db.init_db()
     auth_manager.clear_all_account_unavailable()
+    # `load_unavailable_state` 只读一次（幂等），这个标志是进程级的；
+    # 测试之间必须重置，否则后面的用例会拿到上一轮的状态。
+    auth_manager._unavailable_loaded = False
     yield path
     auth_manager.clear_all_account_unavailable()
+    auth_manager._unavailable_loaded = False
     credential_crypto.reset_cache()
 
 
@@ -218,3 +222,84 @@ def _async_list(items):
     async def _inner():
         return items
     return _inner()
+
+
+# ---------------------------------------------------------------- 重启不丢
+
+def test_unavailable_cooldown_survives_restart(isolated_db, monkeypatch):
+    """长期不可用冷却必须落盘：重启后账号不能「复活」成零负载的候选人。
+
+    回归（2026-11-09）：这个状态以前只存在进程内存里。改代码/换配置/重开机都会让它
+    清空，于是已被上游封掉的号又以「零负载」身份回到候选池最前面，接着被派活、接着
+    吃 11140 —— 2026-09-26 那批账号就是这样被反复重试了 925 次。
+
+    封号是服务端行为，网关只能靠「记住已经问过」来避免自己反复触发它。
+    """
+    aid = _make_account()
+    auth_manager.mark_account_unavailable(aid, 11140)
+    assert auth_manager.account_unavailable_reason(aid)
+
+    # 模拟进程重启：内存清空，只保留数据库，然后走启动时的恢复
+    monkeypatch.setattr(auth_manager, "_account_unavailable", {})
+    monkeypatch.setattr(auth_manager, "_unavailable_loaded", False)
+
+    restored = auth_manager.load_unavailable_state()
+
+    assert restored == 1
+    assert auth_manager.account_unavailable_reason(aid) == "request_illegal(code=11140)"
+
+
+def test_restored_cooldown_keeps_remaining_time_not_reset(isolated_db, monkeypatch):
+    """恢复时要接着原来的剩余时长，不能又从 6 小时重新算一遍。"""
+    aid = _make_account()
+    auth_manager.mark_account_unavailable(aid, 14017)
+    original = auth_manager.account_unavailable_snapshot()[aid]["seconds_left"]
+
+    monkeypatch.setattr(auth_manager, "_account_unavailable", {})
+    monkeypatch.setattr(auth_manager, "_unavailable_loaded", False)
+    auth_manager.load_unavailable_state()
+
+    restored = auth_manager.account_unavailable_snapshot()[aid]["seconds_left"]
+    assert abs(restored - original) <= 2, "剩余时长应基本不变"
+
+
+def test_expired_cooldown_is_not_restored(isolated_db, monkeypatch):
+    """已经过期的冷却不该被恢复：那等于让账号永久停在不可用状态。"""
+    aid = _make_account()
+    auth_manager.mark_account_unavailable(aid, 14017)
+    # 把落盘内容改成已过期
+    db.set_setting(
+        auth_manager._UNAVAILABLE_SETTING_KEY,
+        {str(aid): {"code": 14017, "reason": "trial_not_activated", "seconds_left": 0}},
+    )
+    monkeypatch.setattr(auth_manager, "_account_unavailable", {})
+    monkeypatch.setattr(auth_manager, "_unavailable_loaded", False)
+
+    assert auth_manager.load_unavailable_state() == 0
+    assert auth_manager.account_unavailable_reason(aid) is None
+
+
+def test_clear_also_drops_persisted_entry(isolated_db, monkeypatch):
+    """清掉冷却时要同步落盘，否则重启后又会把它捡回来。"""
+    aid = _make_account()
+    auth_manager.mark_account_unavailable(aid, 14017)
+    auth_manager.clear_account_unavailable(aid)
+
+    monkeypatch.setattr(auth_manager, "_account_unavailable", {})
+    monkeypatch.setattr(auth_manager, "_unavailable_loaded", False)
+    assert auth_manager.load_unavailable_state() == 0
+    assert auth_manager.account_unavailable_reason(aid) is None
+
+
+def test_load_unavailable_state_is_idempotent(isolated_db):
+    """启动路径可能被重复触发（reload、多入口），恢复必须幂等。
+
+    第一次读会把落盘的那一条恢复回来；此后同进程内再读必须什么都不做 ——
+    否则每触发一次就会把冷却时长又往前推一份，账号永远解不开。
+    """
+    aid = _make_account()
+    auth_manager.mark_account_unavailable(aid, 14017)
+
+    assert auth_manager.load_unavailable_state() == 1, "首次读应恢复落盘的那一条"
+    assert auth_manager.load_unavailable_state() == 0, "同进程内第二次读不应重复叠加"
+    assert auth_manager.account_unavailable_reason(aid)

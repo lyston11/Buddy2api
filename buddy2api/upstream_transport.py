@@ -307,13 +307,26 @@ def transport_for(account: Optional[dict] = None) -> Optional[httpx.AsyncBaseTra
     """按账号站点选出站传输层。
 
     - 国际版账号：有代理候选就一律走代理（见 AlwaysProxyTransport）；
-    - 其余（国内站、自定义 relay）：保持直连优先 + 建连失败兜底；
-    - 没有代理候选：返回 None，调用方照旧直连（行为与以前完全一致）。
+    - **国内版账号：永远直连，绝不用代理兜底**；
+    - 自定义 relay / 无名 domain：保持直连优先 + 建连失败兜底；
+    - 没有代理候选：返回 None，调用方照旧直连。
+
+    为什么国内号绝不能兜底代理（2026-11-09 事故后加固）：`proxy_for_retry()` 拿到的是
+    系统代理，而本机那个出口是**美国 Oracle 机房 IP**（实测 129.146.198.122 / US /
+    Oracle Corporation）。一个平时从杭州电信住宅 IP（125.122.2.115）发请求的国内账号
+    一旦建连失败、静默从美国机房 IP 重打，就变成「账号定位在中国、请求来自境外 VPS」
+    —— 这正是上游判定 `11140 unusual activity` 的典型画像。日志里国内账号已经出现过
+    `upstream_disconnect` / `ConnectTimeout`，也就是说这条路径**真的会被走到**。
+    代价只是断网期间国内请求直接失败（客户端可重试），远小于把账号搭进去。
     """
     proxy = proxy_for_retry()
     if proxy is None:
         return None
-    if intl_proxy_enabled() and sites.is_intl_domain((account or {}).get("domain")):
+    domain = (account or {}).get("domain")
+    if sites.is_cn_domain(domain):
+        # 国内站：只直连。不发代理、也不兜底代理，避免跨地区出口切换。
+        return None
+    if intl_proxy_enabled() and sites.is_intl_domain(domain):
         return AlwaysProxyTransport(proxy)
     return FallbackTransport(direct_transport(), proxy)
 

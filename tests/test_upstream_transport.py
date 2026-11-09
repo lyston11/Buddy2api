@@ -237,11 +237,18 @@ def test_intl_account_always_goes_through_proxy(_proxy_available):
     assert transport._proxy == "http://127.0.0.1:7897"
 
 
-def test_domestic_account_keeps_direct_first(_proxy_available):
-    """国内站行为不变：仍是直连优先 + 建连失败兜底。"""
-    transport = upstream_transport.transport_for(DOMESTIC)
+def test_domestic_account_never_uses_proxy(_proxy_available):
+    """国内站只看直连，连建连失败也不换代理。
 
-    assert isinstance(transport, upstream_transport.FallbackTransport)
+    回归（2026-11-09）：以前国内号走 `FallbackTransport`，建连失败会静默从系统代理
+    重发。本机那个代理的出口是**美国 Oracle 机房 IP**（实测 129.146.198.122 / US），
+    而国内账号平时是杭州电信住宅 IP（125.122.2.115）。一个「定位在国内、请求来自
+    境外 VPS」的切跳正是上游判 `11140 unusual activity` 的典型画像，而日志里国内
+    账号确实出现过 `upstream_disconnect` —— 这条路径会被走到。
+
+    代价：断网期间国内请求直接失败（客户端可重试）。远小于把账号搭进去。
+    """
+    assert upstream_transport.transport_for(DOMESTIC) is None
 
 
 def test_intl_proxy_can_be_disabled(_proxy_available, monkeypatch):

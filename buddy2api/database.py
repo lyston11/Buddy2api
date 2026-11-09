@@ -1553,3 +1553,50 @@ def get_all_settings() -> dict:
         except (json.JSONDecodeError, TypeError):
             result[r["key"]] = r["value"]
     return result
+
+
+def account_requests_since(account_id: int, since: int) -> int:
+    """账号自 since（unix 秒）以来成功服务的请求数。
+
+    只统计 2xx：被拒/重打的尝试没有占用上游额度，不该算进「这个号今天跑了多少活」。
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM logs
+            WHERE account_id = ? AND created_at >= ?
+              AND status_code BETWEEN 200 AND 299
+            """,
+            (int(account_id), int(since)),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row["n"] if row else 0)
+
+
+def account_daily_requests(account_id: int) -> int:
+    """账号今天（本地时区 0 点起）成功服务的请求数。"""
+    now = time.time()
+    local_midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+    return account_requests_since(account_id, int(local_midnight))
+
+
+def all_account_daily_requests() -> dict[int, int]:
+    """一次查出所有账号「今天成功服务了多少请求」，供选路节流判断。"""
+    now = time.time()
+    local_midnight = int(time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1)))
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT account_id, COUNT(*) AS n FROM logs
+            WHERE created_at >= ? AND account_id IS NOT NULL
+              AND status_code BETWEEN 200 AND 299
+            GROUP BY account_id
+            """,
+            (local_midnight,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {int(row["account_id"]): int(row["n"]) for row in rows}

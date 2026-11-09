@@ -13,6 +13,7 @@ proxy.py — 请求代理转发
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -23,6 +24,7 @@ import httpx
 
 import buddy2api.database as db
 import buddy2api.auth_manager as auth_manager
+import buddy2api.account_pacing as account_pacing
 import buddy2api.fingerprint as fingerprint
 from buddy2api.paths import PROJECT_ROOT
 from buddy2api.upstream_transport import client_scope
@@ -1320,6 +1322,17 @@ def _log_request(api_key_info, account, model_name, stream,
         db.record_request(log_data)
     except Exception:
         pass
+    # 日用量软上限提醒（见 account_pacing）：同一个账号每天只报一次，不改路由。
+    # 放在落库之后，计数才能包含刚写完的这一条。
+    if account and status_code == 200:
+        try:
+            note = account_pacing.note_daily_usage(
+                account["id"], db.account_daily_requests(account["id"])
+            )
+            if note:
+                print(note, file=sys.stderr)
+        except Exception:
+            pass
 
 
 async def _json_chat_with_stall_retry(
@@ -1680,146 +1693,149 @@ async def _stream_upstream(
             # 出站客户端按（站点、代理、超时）复用：国际站一律走代理，其余直连优先、
             # 建连失败兜底；连接常驻，与官方客户端的 keep-alive agent 同形
             # （见 upstream_transport.shared_client / transport_for）
-            async with client_scope(account, timeout) as client:
-                async with client.stream("POST", url, headers=headers, json=body) as response:
-                    if response.status_code != 200:
-                        raw_error = await response.aread()
-                        _dump_rejected_request(
-                            body,
-                            response.status_code,
-                            raw_error,
-                            url=url,
-                            account_id=account["id"],
-                        )
-                        failure, http_msg = _classify_http_status(response.status_code, raw_error)
-                        last_error = http_msg.encode("utf-8")
-                        last_error_event = None
-                        last_status = response.status_code
-                        last_failure = failure
-                        detail = _safe_err(raw_error, response.status_code)
-                        channel_blocked = _channel_verification_error(
-                            response.status_code, detail
-                        )
-                        # 渠道校验失败：换一套指纹（app ↔ cli）在同一账号上再打一次。
-                        # 11128 说的是我们这侧的头/体形态，与账号无关，所以既不给
-                        # 账号记失败、也不占换号或链路额度。
-                        if channel_blocked and _plan_channel_retry(channel_retries):
-                            channel_retries += 1
-                            fingerprint.switch_channel()
-                            tried_ids.discard(account["id"])
-                            channel_account = account
-                            pending_retry_log = {
-                                "account": account,
-                                "prompt_tokens": 0,
-                                "completion_tokens": 0,
-                                "total_tokens": 0,
-                                "credit": 0,
-                                "status": response.status_code,
-                                "message": _failure_log_message(FAILURE_CHANNEL, http_msg),
-                                "started": t0,
-                                "attempt": attempt,
-                                "attempts": attempts_now,
-                            }
-                            continue
-                        # 见 _model_unavailable_error：模型不属于这个账号的站点，
-                        # 换号能成功，别把账号记成故障。
-                        model_blocked = _model_unavailable_error(
-                            response.status_code, detail
-                        )
-                        unavailable_code = _account_unavailable_code(
-                            response.status_code, detail
-                        )
-                        if channel_blocked:
-                            # 换过身份仍被拒：网关侧的头/体问题，不给账号记失败。
-                            failure = FAILURE_CHANNEL
-                            last_failure = FAILURE_CHANNEL
-                        elif model_blocked:
-                            auth_manager.mark_model_denied(
-                                account["id"], body.get("model")
+            # 账号级出站节流：单账号在途请求数超过上限时先排队（见 account_pacing）。
+            # 名额要覆盖整个流式响应，所以包在 client_scope 外层。
+            async with account_pacing.slot(account["id"]):
+                async with client_scope(account, timeout) as client:
+                    async with client.stream("POST", url, headers=headers, json=body) as response:
+                        if response.status_code != 200:
+                            raw_error = await response.aread()
+                            _dump_rejected_request(
+                                body,
+                                response.status_code,
+                                raw_error,
+                                url=url,
+                                account_id=account["id"],
                             )
-                        elif unavailable_code:
-                            # 上游明确说这个账号不能用（试用未激活 / 积分耗尽 /
-                            # 账号级风控封禁）：打长冷却，别当限流那样 15 分钟就
-                            # 重新派活（见 auth_manager.ACCOUNT_UNAVAILABLE_CODES）。
-                            auth_manager.mark_account_unavailable(
-                                account["id"], unavailable_code
+                            failure, http_msg = _classify_http_status(response.status_code, raw_error)
+                            last_error = http_msg.encode("utf-8")
+                            last_error_event = None
+                            last_status = response.status_code
+                            last_failure = failure
+                            detail = _safe_err(raw_error, response.status_code)
+                            channel_blocked = _channel_verification_error(
+                                response.status_code, detail
                             )
-                            auth_manager.clear_model_rate_limit(
-                                account["id"], body.get("model")
+                            # 渠道校验失败：换一套指纹（app ↔ cli）在同一账号上再打一次。
+                            # 11128 说的是我们这侧的头/体形态，与账号无关，所以既不给
+                            # 账号记失败、也不占换号或链路额度。
+                            if channel_blocked and _plan_channel_retry(channel_retries):
+                                channel_retries += 1
+                                fingerprint.switch_channel()
+                                tried_ids.discard(account["id"])
+                                channel_account = account
+                                pending_retry_log = {
+                                    "account": account,
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "total_tokens": 0,
+                                    "credit": 0,
+                                    "status": response.status_code,
+                                    "message": _failure_log_message(FAILURE_CHANNEL, http_msg),
+                                    "started": t0,
+                                    "attempt": attempt,
+                                    "attempts": attempts_now,
+                                }
+                                continue
+                            # 见 _model_unavailable_error：模型不属于这个账号的站点，
+                            # 换号能成功，别把账号记成故障。
+                            model_blocked = _model_unavailable_error(
+                                response.status_code, detail
                             )
-                        else:
-                            auth_manager.mark_account_failure(
-                                account["id"], response.status_code, body.get("model")
+                            unavailable_code = _account_unavailable_code(
+                                response.status_code, detail
                             )
-                        if channel_blocked:
-                            will_retry, link_failures = False, link_failures
-                        else:
-                            will_retry, link_failures = _plan_retry(
-                                response.status_code, attempt, max_attempts,
-                                link_failures, model_blocked,
-                                bool(unavailable_code),
+                            if channel_blocked:
+                                # 换过身份仍被拒：网关侧的头/体问题，不给账号记失败。
+                                failure = FAILURE_CHANNEL
+                                last_failure = FAILURE_CHANNEL
+                            elif model_blocked:
+                                auth_manager.mark_model_denied(
+                                    account["id"], body.get("model")
+                                )
+                            elif unavailable_code:
+                                # 上游明确说这个账号不能用（试用未激活 / 积分耗尽 /
+                                # 账号级风控封禁）：打长冷却，别当限流那样 15 分钟就
+                                # 重新派活（见 auth_manager.ACCOUNT_UNAVAILABLE_CODES）。
+                                auth_manager.mark_account_unavailable(
+                                    account["id"], unavailable_code
+                                )
+                                auth_manager.clear_model_rate_limit(
+                                    account["id"], body.get("model")
+                                )
+                            else:
+                                auth_manager.mark_account_failure(
+                                    account["id"], response.status_code, body.get("model")
+                                )
+                            if channel_blocked:
+                                will_retry, link_failures = False, link_failures
+                            else:
+                                will_retry, link_failures = _plan_retry(
+                                    response.status_code, attempt, max_attempts,
+                                    link_failures, model_blocked,
+                                    bool(unavailable_code),
+                                )
+                            if will_retry:
+                                pending_retry_log = {
+                                    "account": account,
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "total_tokens": 0,
+                                    "credit": 0,
+                                    "status": response.status_code,
+                                    "message": _failure_log_message(failure, http_msg),
+                                    "started": t0,
+                                    "attempt": attempt,
+                                    "attempts": attempts_now,
+                                }
+                                continue
+                            _log_request(
+                                api_key_info, account, model_name, True,
+                                0, 0, 0, 0, failure, response.status_code,
+                                _failure_log_message(failure, http_msg), t0,
+                                attempts=attempts_now,
                             )
-                        if will_retry:
-                            pending_retry_log = {
-                                "account": account,
-                                "prompt_tokens": 0,
-                                "completion_tokens": 0,
-                                "total_tokens": 0,
-                                "credit": 0,
-                                "status": response.status_code,
-                                "message": _failure_log_message(failure, http_msg),
-                                "started": t0,
-                                "attempt": attempt,
-                                "attempts": attempts_now,
-                            }
-                            continue
-                        _log_request(
-                            api_key_info, account, model_name, True,
-                            0, 0, 0, 0, failure, response.status_code,
-                            _failure_log_message(failure, http_msg), t0,
-                            attempts=attempts_now,
-                        )
-                        yield _err_sse_event(last_error, response.status_code, failure)
-                        return
+                            yield _err_sse_event(last_error, response.status_code, failure)
+                            return
 
-                    async for chunk in response.aiter_bytes():
-                        if not chunk:
-                            continue
-                        for data in decoder.feed(chunk):
-                            obj = observer.observe_event(data)
-                            if obj is not None and not obj.get("error"):
-                                encoded = _json_sse_event(obj)
-                                if pending_terminal_events or _has_terminal_choice(obj):
-                                    pending_terminal_events.append(encoded)
-                                    pending_terminal_bytes += len(encoded)
-                                    if pending_terminal_bytes > _MAX_SSE_EVENT_BYTES:
-                                        observer.parser_error = (
-                                            "The upstream terminal SSE events exceeded the 8 MiB limit."
-                                        )
-                                else:
-                                    output_started = True
-                                    if hold is None:
-                                        yield encoded
+                        async for chunk in response.aiter_bytes():
+                            if not chunk:
+                                continue
+                            for data in decoder.feed(chunk):
+                                obj = observer.observe_event(data)
+                                if obj is not None and not obj.get("error"):
+                                    encoded = _json_sse_event(obj)
+                                    if pending_terminal_events or _has_terminal_choice(obj):
+                                        pending_terminal_events.append(encoded)
+                                        pending_terminal_bytes += len(encoded)
+                                        if pending_terminal_bytes > _MAX_SSE_EVENT_BYTES:
+                                            observer.parser_error = (
+                                                "The upstream terminal SSE events exceeded the 8 MiB limit."
+                                            )
                                     else:
-                                        for ready in hold.feed(
-                                            encoded,
-                                            _event_content_chars(obj),
-                                            _event_has_tool_calls(obj),
-                                        ):
-                                            yield ready
-                            if (
-                                observer.seen_done
-                                or observer.parser_error
-                                or observer.malformed_data_event
-                                or observer.upstream_error
-                            ):
+                                        output_started = True
+                                        if hold is None:
+                                            yield encoded
+                                        else:
+                                            for ready in hold.feed(
+                                                encoded,
+                                                _event_content_chars(obj),
+                                                _event_has_tool_calls(obj),
+                                            ):
+                                                yield ready
+                                if (
+                                    observer.seen_done
+                                    or observer.parser_error
+                                    or observer.malformed_data_event
+                                    or observer.upstream_error
+                                ):
+                                    stop_reading = True
+                                    break
+                            if decoder.parser_error and not observer.seen_done:
+                                observer.parser_error = decoder.parser_error
                                 stop_reading = True
+                            if stop_reading:
                                 break
-                        if decoder.parser_error and not observer.seen_done:
-                            observer.parser_error = decoder.parser_error
-                            stop_reading = True
-                        if stop_reading:
-                            break
         except httpx.HTTPError as exc:
             failure = FAILURE_UPSTREAM_DISCONNECT
             http_msg = _format_httpx_error(exc)
@@ -2039,46 +2055,49 @@ async def _collect_stream(
     seen_done = False
 
     try:
-        async with client_scope(account, auth_manager.request_timeout(300)) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    raw = await r.aread()
-                    detail = _safe_err(raw, r.status_code)
-                    return ("error", (r.status_code, detail))
+        # 账号级出站节流：同一账号在途请求超过上限时先排队（见 account_pacing），
+        # 名额覆盖「发请求 + 读完响应」整段。
+        async with account_pacing.slot(account["id"]):
+            async with client_scope(account, auth_manager.request_timeout(300)) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        raw = await r.aread()
+                        detail = _safe_err(raw, r.status_code)
+                        return ("error", (r.status_code, detail))
 
-                async for line in r.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        seen_done = True
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    model = chunk.get("model") or model
-                    if chunk.get("usage"):
-                        usage = chunk["usage"]
-                    for choice in chunk.get("choices") or []:
-                        if choice.get("finish_reason"):
-                            finish_reason = choice["finish_reason"]
-                        delta = choice.get("delta") or {}
-                        if delta.get("content"):
-                            content_parts.append(delta["content"])
-                        if delta.get("reasoning_content"):
-                            reasoning_parts.append(delta["reasoning_content"])
-                        for tc in delta.get("tool_calls") or []:
-                            idx = tc.get("index", 0)
-                            slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
-                            if tc.get("id"):
-                                slot["id"] = tc["id"]
-                            fn = tc.get("function") or {}
-                            if fn.get("name"):
-                                slot["name"] = fn["name"]
-                            if fn.get("arguments"):
-                                slot["arguments"] += fn["arguments"]
+                    async for line in r.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            seen_done = True
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        model = chunk.get("model") or model
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        for choice in chunk.get("choices") or []:
+                            if choice.get("finish_reason"):
+                                finish_reason = choice["finish_reason"]
+                            delta = choice.get("delta") or {}
+                            if delta.get("content"):
+                                content_parts.append(delta["content"])
+                            if delta.get("reasoning_content"):
+                                reasoning_parts.append(delta["reasoning_content"])
+                            for tc in delta.get("tool_calls") or []:
+                                idx = tc.get("index", 0)
+                                slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                                if tc.get("id"):
+                                    slot["id"] = tc["id"]
+                                fn = tc.get("function") or {}
+                                if fn.get("name"):
+                                    slot["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    slot["arguments"] += fn["arguments"]
     except httpx.HTTPError as e:
         return (
             "error",

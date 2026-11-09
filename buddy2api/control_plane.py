@@ -623,10 +623,17 @@ async def probe_accounts_health(
 
     `mark=True` 时把上游明确判定不可用的账号直接打上长冷却（见
     auth_manager.ACCOUNT_UNAVAILABLE_CODES），这样巡检完选路就会跳过它们。
+
+    **已在长期不可用冷却里的账号不再巡检**（除了调用方用 account_ids 点名）。
+    巡检是真实请求：对着一个已被上游封掉的号反复发 "pong"，等于每隔几分钟就
+    往封禁判定上再补一笔证据，只会让短期处罚更难解开，也拿不到新信息 —— 那个
+    结论（code=11140 等）已经记在冷却里了，直接报出来即可。
+    点名（`account_ids`）时照常真发：人工要确认「解封了没有」必须能真打一条。
     """
     wanted_channels = set(channel_filter) if channel_filter else None
     wanted_ids = {int(value) for value in account_ids} if account_ids else None
     results: list[dict] = []
+    skipped: list[dict] = []
     for channel in providers.enabled_provider_ids():
         if wanted_channels is not None and channel not in wanted_channels:
             continue
@@ -635,6 +642,8 @@ async def probe_accounts_health(
         accounts = await _channel_accounts(channel, status="")
         if wanted_ids is not None:
             accounts = [a for a in accounts if int(a["id"]) in wanted_ids]
+        accounts, blocked = _split_probeable(accounts, wanted_ids)
+        skipped.extend(blocked)
         if not accounts:
             continue
         chunk = await _gather_limited(
@@ -654,13 +663,53 @@ async def probe_accounts_health(
 
     broken = [item for item in results if not item.get("ok")]
     return {
-        "total": len(results),
+        "total": len(results) + len(skipped),
         "ok": len(results) - len(broken),
         "broken": len(broken),
+        "skipped": len(skipped),
         "marked": marked,
         "model": model,
-        "results": results,
+        "results": results + skipped,
     }
+
+
+def _split_probeable(accounts: list[dict], wanted_ids: set[int] | None) -> tuple[list[dict], list[dict]]:
+    """把「已在长期冷却里」的账号从巡检名单里挑出来（点名的不挑）。
+
+    挑出来的直接回一份带原因的记录：管理页既能看出它现在不能用，又不必真的去
+    碰一下上游。
+    """
+    probeable: list[dict] = []
+    blocked: list[dict] = []
+    snapshot = auth_manager.account_unavailable_snapshot()
+    for account in accounts:
+        aid = int(account["id"])
+        info = snapshot.get(aid)
+        if not info or (wanted_ids and aid in wanted_ids):
+            probeable.append(account)
+            continue
+        blocked.append(
+            {
+                "account_id": aid,
+                "account_name": account.get("nickname") or account.get("name") or "",
+                "domain": str(account.get("domain") or "").strip(),
+                "status": account.get("status") or "",
+                "provider": account.get("provider") or "workbuddy",
+                "http": 0,
+                "code": int(info.get("code") or 0),
+                "ok": False,
+                "skipped": True,
+                "verdict": _PROBE_REASON_TEXT.get(
+                    int(info.get("code") or 0), info.get("reason") or "账号级不可用"
+                ),
+                "detail": (
+                    f"已在长期不可用冷却中（{info.get('reason')}，"
+                    f"约 {int(info.get('seconds_left') or 0) // 60} 分钟后重试）；"
+                    "为不加深风控，本次不再向上游真发请求。"
+                ),
+            }
+        )
+    return probeable, blocked
 
 
 async def checkin_all(channel_filter: list[str] | None = None) -> dict:

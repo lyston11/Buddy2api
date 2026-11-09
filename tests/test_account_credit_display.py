@@ -39,6 +39,7 @@ AccountId / Uin / AppId / DealName 等身份信息）。期望值就是同一次
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -364,10 +365,12 @@ def test_expiring_totals_use_official_expiry(isolated_db, monkeypatch):
     result = _fetch(aid)
 
     active = [p for p in result["packages"] if not p["expired"]]
-    assert len(active) == 1, "三条包里只有 2026-11-06 那条还在有效期内"
+    assert len(active) == 1, "三条包里只有最晚那条还在有效期内"
     assert result["expiring_30d_total"] == pytest.approx(100.0)
     assert result["next_expire_amount"] == pytest.approx(100.0)
-    assert result["next_expire_days"] == 29
+    # 天数随运行日变动，不能写死：用包自己的到期时间戳反算
+    expected_days = int((active[0]["expire_ts"] - int(time.time())) / 86400)
+    assert result["next_expire_days"] == expected_days
 
 
 def test_expired_status3_package_is_not_counted_as_available(isolated_db, monkeypatch):

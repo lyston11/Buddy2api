@@ -155,6 +155,39 @@ Two things that are easy to get wrong — both were real bugs here:
 
 So the “official balance” column is now exactly the number on the official page, and each package's “remaining” in the detail dialog is the current-period amount rather than the full package cap.
 
+### Why do accounts get banned, and what does the gateway do about it?
+
+One thing up front: **a ban is a server-side action by the upstream. The gateway cannot prevent it — it can only avoid actively triggering it.**
+
+When the user reported "all my international accounts are banned" (2026-11-09), probing each one showed:
+
+- all 6 international accounts returned `403 code=11140` for `POST /v2/chat/completions`;
+- **the same token** still returned `200` for `get-user-resource-summary` (balance) and for the model catalog — the account is not deleted, the credits are still there, `refresh_token` is still valid, **it is chat that is restricted**;
+- the upstream `displayMsg` reads "Your account has been restricted due to unusual activity", and `displayTips` even offers an appeal link.
+
+That is an **account-behaviour** penalty, not content moderation. Both are reported as `11140`, but the wording differs completely — don't conflate them: the batch on 2026-09-26 said "The content did not pass the safety review", which is request content.
+
+So what does "unusual activity" mean? The logs measure it directly (same accounts, compared against domestic accounts on a normal day):
+
+| Metric | 6 international accounts (10-28, peak week before the ban) | 3 domestic accounts (11-05, normal use) |
+| --- | --- | --- |
+| Requests per account per day | 1411 – 1424 | 350 – 612 |
+| Peak in-flight per account | **8 – 10** | **3 – 4** |
+| Median gap between requests | **4 s** | 53 – 95 s |
+| Activity span | 02:00–23:00 (19 hours straight) | 09:00–18:00 |
+
+A real client runs one or two sessions at a time; it cannot produce 8–10 in-flight, one request every 4 seconds, for 19 hours on the same account. And the gateway previously had **no** per-account pacing at all — the user's batch calls landed on a single account verbatim.
+
+Three layers were added:
+
+1. **Per-account in-flight cap** (`account_pacing`, default 3, tune with `CB_GATEWAY_ACCOUNT_MAX_INFLIGHT`, `0`/`off` disables). Excess requests queue (with a timeout that lets them through), and the slot spans the whole streaming response. The default sits on the observed domestic peak of 3–4, so normal use is unaffected while an 8–10 load-test shape gets smoothed out. Concurrency only, not total volume — volume is the user's usage decision; concurrency is the proxy for "how many clients one person can run".
+2. **Domestic accounts never use a proxy** (`upstream_transport.transport_for`). Previously a domestic account whose direct connect failed would silently retry through the system proxy, and that proxy's egress is a **US Oracle datacenter IP** (`129.146.198.122`) while domestic accounts normally egress from a Hangzhou Telecom residential IP (`125.122.2.115`). A "located in China, requesting from an overseas VPS" jump is exactly the risk-control signature, and the logs show domestic accounts really did hit `upstream_disconnect` — so that path does get taken. Now domestic sites are direct-only; if the network is down, it is down, and the client retries.
+3. **Long-term unavailability cooldowns are persisted, and health probes skip banned accounts.** The `11140`/`14017`/`14018` cooldowns used to live only in process memory and were lost on restart — so an already-banned account came back at the front of the candidate pool with "zero load", got dispatched, and ate another `11140` (that is how the 2026-09-26 batch was retried 925 times). The cooldowns are now written to settings and restored at startup; the health probe also skips accounts already in cooldown (unless you name them explicitly, in which case what you want to know is precisely whether the ban has been lifted).
+
+One more, observation-only (it does not change routing): a **per-account daily soft limit** (default 800, `CB_GATEWAY_ACCOUNT_DAILY_SOFT_LIMIT`). Crossing it logs one line to stderr, once per account per day. The threshold sits between "normal use 350–612" and "1400+ on the day of the ban".
+
+How to recover from a ban: if the "official balance" column still shows credits, the credentials and quota are fine and only chat is restricted. You need to use the appeal link from `displayTips` — nothing on the gateway side can lift it. The admin page shows the "unavailable" badge with the reason, remaining time, and the upstream business code.
+
 ### How do expiring credits get used first?
 
 Account credits come in **time-limited packages** that are lost on expiry. So **on calls that really do consume credits**, the gateway prefers the account whose credits expire soonest — that is exactly what the “Expiring soon” column on the accounts page reports (the `30-day expiring` total plus the nearest expiry time).
